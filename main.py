@@ -17,7 +17,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Third-party imports
 import pandas as pd
-from anthropic import Anthropic
 from google_play_scraper import app, reviews, Sort
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment
@@ -26,8 +25,11 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-# Initialize Anthropic client
-client = Anthropic()
+# Import LLM abstraction
+from config.llm_client import get_llm_client, OllamaClient
+
+# Initialize LLM client (Ollama or fallback)
+client = get_llm_client()
 
 # Configuration
 SWIGGY_APP_ID = "in.swiggy.android"
@@ -181,18 +183,6 @@ def save_cached_reviews(app_id: str, reviews: list) -> None:
         print(f"  ✓ Cached {len(reviews)} reviews for {app_id} ({file_size_mb:.2f} MB)")
     except Exception as e:
         print(f"  Warning: Could not save cache: {e}")
-
-
-def extract_json_from_response(response_text: str) -> dict:
-    """Extract JSON from Claude response, handling markdown code blocks."""
-    # Remove markdown code blocks if present
-    text = response_text.strip()
-    if text.startswith("```"):
-        text = text.split("```")[1]
-        if text.startswith("json"):
-            text = text[4:]
-    text = text.strip()
-    return json.loads(text)
 
 
 def scrape_reviews(app_id: str, start_date: datetime, end_date: datetime) -> Dict[str, List[dict]]:
@@ -373,18 +363,15 @@ def generate_mock_reviews(start_date: datetime, end_date: datetime) -> Dict[str,
 
 
 def extract_topics_from_review(review_text: str) -> List[dict]:
-    """Extract topics from a single review using Claude Haiku."""
+    """Extract topics from a single review using LLM (Ollama or fallback)."""
     try:
+        # Switch to extraction model if using Ollama
+        if isinstance(client, OllamaClient):
+            client.set_extraction_mode()
+
         prompt = EXTRACTION_PROMPT.format(review_text=review_text)
-
-        response = client.messages.create(
-            model="claude-3-5-haiku-20241022",
-            max_tokens=500,
-            messages=[{"role": "user", "content": prompt}]
-        )
-
-        response_text = response.content[0].text
-        topics = extract_json_from_response(response_text)
+        response_text = client.chat(prompt, max_tokens=500, temperature=0.1)
+        topics = client.extract_json(response_text)
 
         # Ensure topics is a list
         if not isinstance(topics, list):
@@ -397,8 +384,12 @@ def extract_topics_from_review(review_text: str) -> List[dict]:
 
 
 def extract_topics_batch(reviews_batch: List[dict]) -> Dict[int, List[dict]]:
-    """Extract topics from a batch of reviews using a single API call."""
+    """Extract topics from a batch of reviews using a single LLM call."""
     try:
+        # Switch to extraction model if using Ollama
+        if isinstance(client, OllamaClient):
+            client.set_extraction_mode()
+
         # Build batch string (optimized for larger batches)
         batch_str = ""
         for idx, review in enumerate(reviews_batch):
@@ -412,27 +403,8 @@ def extract_topics_batch(reviews_batch: List[dict]) -> Dict[int, List[dict]]:
             return {}
 
         prompt = BATCH_EXTRACTION_PROMPT.format(reviews_batch=batch_str)
-
-        response = client.messages.create(
-            model="claude-3-5-haiku-20241022",
-            max_tokens=6000,  # Increased for larger batches
-            timeout=30.0,  # 30 second timeout
-            messages=[{"role": "user", "content": prompt}]
-        )
-
-        # Check rate limit headers (on first request only)
-        if hasattr(response, '_headers') and not hasattr(extract_topics_batch, '_rate_limit_shown'):
-            headers = response._headers
-            if 'x-ratelimit-requests-limit' in headers:
-                print(f"\n  📊 API Rate Limits Detected:")
-                print(f"    Requests/min: {headers.get('x-ratelimit-requests-limit', 'N/A')}")
-                print(f"    Tokens/min: {headers.get('x-ratelimit-tokens-limit', 'N/A')}")
-                print(f"    Remaining requests: {headers.get('x-ratelimit-requests-remaining', 'N/A')}")
-                print(f"    Remaining tokens: {headers.get('x-ratelimit-tokens-remaining', 'N/A')}\n")
-                extract_topics_batch._rate_limit_shown = True
-
-        response_text = response.content[0].text
-        result = extract_json_from_response(response_text)
+        response_text = client.chat(prompt, max_tokens=6000, temperature=0.1)
+        result = client.extract_json(response_text)
 
         # Parse results
         topics_by_idx = {}
@@ -516,9 +488,14 @@ def process_batch_wrapper(args):
         return batch_id, [], len(batch)
 
 
-def extract_all_topics(reviews_by_date: Dict[str, List[dict]]) -> Dict[str, List[str]]:
+def extract_all_topics(reviews_by_date: Dict[str, List[dict]], progress_callback=None) -> Dict[str, List[str]]:
     """
     Extract topics from all reviews using optimized parallel batch processing.
+
+    Args:
+        reviews_by_date: Mapping of date strings to lists of review dictionaries
+        progress_callback: Optional function(processed, total) to report progress
+
     Returns mapping of date -> list of unique topics.
     """
     print("Extracting topics from reviews (using parallel batch processing)...")
@@ -576,6 +553,10 @@ def extract_all_topics(reviews_by_date: Dict[str, List[dict]]) -> Dict[str, List
                 date_topics.extend(topics)
                 processed += batch_size
 
+                # Call progress callback if provided
+                if progress_callback and processed % 50 == 0:  # Update every 50 reviews
+                    progress_callback(processed, total_reviews)
+
                 if processed % progress_interval == 0:
                     elapsed = time.time() - start_time
                     rate = processed / elapsed if elapsed > 0 else 0
@@ -584,6 +565,10 @@ def extract_all_topics(reviews_by_date: Dict[str, List[dict]]) -> Dict[str, List
 
         if date_topics:
             topics_by_date[date_str] = date_topics
+
+    # Final callback
+    if progress_callback:
+        progress_callback(total_reviews, total_reviews)
 
     total_time = time.time() - start_time
     print(f"✓ Extracted topics from {processed} reviews using ULTRA-FAST parallel processing")
@@ -653,19 +638,17 @@ def consolidate_topics(all_topics: List[str]) -> Dict[str, List[str]]:
         topics_str += f"\n... and {len(representative_topics) - 200} more topics"
 
     try:
+        # Switch to consolidation model if using Ollama (high quality needed here)
+        if isinstance(client, OllamaClient):
+            client.set_consolidation_mode()
+
         prompt = CONSOLIDATION_PROMPT.format(
             num_topics=len(representative_topics),
             topics_list=topics_str
         )
 
-        response = client.messages.create(
-            model="claude-3-5-sonnet-20241022",
-            max_tokens=4000,  # Increased for more topics
-            messages=[{"role": "user", "content": prompt}]
-        )
-
-        response_text = response.content[0].text
-        result = extract_json_from_response(response_text)
+        response_text = client.chat(prompt, max_tokens=4000, temperature=0.1)
+        result = client.extract_json(response_text)
 
         # Build canonical mapping
         canonical_mapping = {}
@@ -741,13 +724,19 @@ def consolidate_topics_heuristic(unique_topics: List[str]) -> Dict[str, List[str
     canonical_mapping = {}
     mapped_topics = set()
 
-    for canonical, variations in consolidation_rules.items():
-        matching_topics = [t for t in unique_topics if t in variations]
+    for canonical, keywords in consolidation_rules.items():
+        matching_topics = []
+        for topic in unique_topics:
+            topic_lower = topic.lower()
+            # Check if any keyword appears in the topic
+            if any(keyword in topic_lower for keyword in keywords):
+                matching_topics.append(topic)
+                mapped_topics.add(topic)
+        
         if matching_topics:
             canonical_mapping[canonical] = matching_topics
-            mapped_topics.update(matching_topics)
 
-    # Add unmapped topics
+    # Add unmapped topics as their own canonical topics
     for topic in unique_topics:
         if topic not in mapped_topics:
             canonical_mapping[topic] = [topic]
@@ -756,26 +745,72 @@ def consolidate_topics_heuristic(unique_topics: List[str]) -> Dict[str, List[str
 
 
 def map_topics_to_canonical(topics_by_date: Dict[str, List[str]],
-                           canonical_mapping: Dict[str, List[str]]) -> Dict[str, Dict[str, int]]:
+                           canonical_mapping: Dict[str, List[str]]) -> tuple[Dict[str, Dict[str, int]], Dict[str, str]]:
     """
     Map extracted topics to canonical topics and count frequencies by date.
-    Returns date -> canonical_topic -> count mapping.
+    Returns: (date -> canonical_topic -> count mapping, unmapped_topics -> suggested_canonical mapping)
     """
-    # Build reverse mapping: variation -> canonical
+    # Build reverse mapping: variation -> canonical (case-insensitive)
     variation_to_canonical = {}
     for canonical, variations in canonical_mapping.items():
         for variation in variations:
             variation_to_canonical[variation.lower()] = canonical
 
+    # Track unmapped topics
+    unmapped_topics = {}
+    
     # Count topics by date
     result = {}
     for date_str in sorted(topics_by_date.keys()):
         result[date_str] = {}
         for topic in topics_by_date[date_str]:
-            canonical = variation_to_canonical.get(topic.lower(), topic)
+            topic_lower = topic.lower()
+            
+            # Try exact match first
+            if topic_lower in variation_to_canonical:
+                canonical = variation_to_canonical[topic_lower]
+            else:
+                # Try fuzzy matching - check if topic contains any canonical variation
+                canonical = None
+                for var, can in variation_to_canonical.items():
+                    if var in topic_lower or topic_lower in var:
+                        canonical = can
+                        break
+                
+                # If still not found, use original topic but track it
+                if canonical is None:
+                    canonical = topic
+                    if topic not in unmapped_topics:
+                        # Try to find best canonical match based on keywords
+                        best_match = find_best_canonical_match(topic, canonical_mapping)
+                        unmapped_topics[topic] = best_match
+            
             result[date_str][canonical] = result[date_str].get(canonical, 0) + 1
 
-    return result
+    return result, unmapped_topics
+
+
+def find_best_canonical_match(topic: str, canonical_mapping: Dict[str, List[str]]) -> str:
+    """Find the best canonical topic match for an unmapped topic using keyword similarity."""
+    topic_lower = topic.lower()
+    topic_words = set(re.findall(r'\w+', topic_lower))
+    
+    best_match = topic  # Default to original
+    best_score = 0
+    
+    for canonical, variations in canonical_mapping.items():
+        # Get all words from all variations
+        all_words = set()
+        for var in variations:
+            all_words.update(re.findall(r'\w+', var.lower()))
+        
+        # Calculate word overlap
+        overlap = len(topic_words & all_words)
+        if overlap > best_score:
+            best_score = overlap
+            best_match = canonical
+    
+    return best_match if best_score > 0 else topic
 
 
 def extract_app_id_from_link(link: str) -> str:
@@ -798,8 +833,10 @@ def extract_app_id_from_link(link: str) -> str:
 
 def generate_trend_report(canonical_counts: Dict[str, Dict[str, int]],
                          target_date: datetime,
-                         output_file: str) -> None:
-    """Generate Excel trend report with Topic x Date matrix."""
+                         output_file: str,
+                         canonical_mapping: Dict[str, List[str]],
+                         unmapped_topics: Dict[str, str]) -> None:
+    """Generate Excel trend report with Topic x Date matrix and validation."""
     print(f"Generating trend report for {target_date.date()}...")
 
     # Ensure we have 30 days of data
@@ -807,13 +844,62 @@ def generate_trend_report(canonical_counts: Dict[str, Dict[str, int]],
     date_range = [start_date + timedelta(days=i) for i in range(30)]
     date_strs = [d.strftime("%Y-%m-%d") for d in date_range]
 
-    # Collect all topics
-    all_topics = set()
+    # Collect all topics that appear in the data
+    all_topics_in_data = set()
     for date_str in date_strs:
         if date_str in canonical_counts:
-            all_topics.update(canonical_counts[date_str].keys())
+            all_topics_in_data.update(canonical_counts[date_str].keys())
 
-    all_topics = sorted(list(all_topics))
+    # VALIDATION: Check for discrepancies
+    print(f"\n📊 VALIDATION REPORT:")
+    print(f"  Expected canonical topics: {len(canonical_mapping)}")
+    print(f"  Topics appearing in Excel: {len(all_topics_in_data)}")
+    
+    if len(all_topics_in_data) != len(canonical_mapping):
+        print(f"  ⚠️  WARNING: Mismatch detected ({len(all_topics_in_data)} vs {len(canonical_mapping)})")
+        
+        # Find topics in data but not in canonical mapping
+        extra_topics = all_topics_in_data - set(canonical_mapping.keys())
+        if extra_topics:
+            print(f"\n  ❌ Topics in Excel but NOT in canonical mapping ({len(extra_topics)}):")
+            for topic in sorted(extra_topics)[:10]:  # Show first 10
+                suggestion = unmapped_topics.get(topic, "Unknown")
+                print(f"    - '{topic}' (suggested: '{suggestion}')")
+            if len(extra_topics) > 10:
+                print(f"    ... and {len(extra_topics) - 10} more")
+        
+        # Find canonical topics that never appear
+        missing_topics = set(canonical_mapping.keys()) - all_topics_in_data
+        if missing_topics:
+            print(f"\n  ℹ️  Canonical topics that never appeared ({len(missing_topics)}):")
+            for topic in sorted(missing_topics)[:5]:
+                print(f"    - '{topic}'")
+            if len(missing_topics) > 5:
+                print(f"    ... and {len(missing_topics) - 5} more")
+    else:
+        print(f"  ✅ Perfect match! All topics mapped correctly.")
+
+    # Count topics with only 1 occurrence total
+    single_occurrence_topics = []
+    for topic in all_topics_in_data:
+        total_count = sum(canonical_counts.get(date_str, {}).get(topic, 0) for date_str in date_strs)
+        if total_count == 1:
+            single_occurrence_topics.append(topic)
+    
+    if single_occurrence_topics:
+        print(f"\n  ⚠️  Topics with only 1 occurrence (likely unmapped) ({len(single_occurrence_topics)}):")
+        for topic in sorted(single_occurrence_topics)[:10]:
+            suggestion = unmapped_topics.get(topic, "Unknown")
+            print(f"    - '{topic}' (suggested: '{suggestion}')")
+        if len(single_occurrence_topics) > 10:
+            print(f"    ... and {len(single_occurrence_topics) - 10} more")
+
+    print()  # Blank line before Excel generation
+
+    # Sort topics: canonical first, then unmapped
+    canonical_topics = sorted([t for t in all_topics_in_data if t in canonical_mapping])
+    unmapped_in_data = sorted([t for t in all_topics_in_data if t not in canonical_mapping])
+    all_topics = canonical_topics + unmapped_in_data
 
     # Create matrix
     data = []
@@ -843,13 +929,24 @@ def generate_trend_report(canonical_counts: Dict[str, Dict[str, int]],
         cell.font = header_font
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
-    # Add data with alternating colors
+    # Add data with alternating colors and highlight unmapped topics
     light_fill = PatternFill(start_color="E8EFF7", end_color="E8EFF7", fill_type="solid")
+    warning_fill = PatternFill(start_color="FFF4CC", end_color="FFF4CC", fill_type="solid")  # Yellow for unmapped
+    
     for row_idx, row_data in enumerate(data, 2):
+        topic_name = row_data[0]
+        is_unmapped = topic_name not in canonical_mapping
+        
         for col_idx, value in enumerate(row_data, 1):
             cell = ws.cell(row=row_idx, column=col_idx, value=value)
-            if row_idx % 2 == 0:
+            
+            # Highlight unmapped topics
+            if is_unmapped and col_idx == 1:
+                cell.fill = warning_fill
+                cell.font = Font(italic=True)
+            elif row_idx % 2 == 0:
                 cell.fill = light_fill
+            
             if col_idx > 1:
                 cell.alignment = Alignment(horizontal="center")
 
@@ -860,9 +957,18 @@ def generate_trend_report(canonical_counts: Dict[str, Dict[str, int]],
         if col_idx < len(col_letters):
             ws.column_dimensions[col_letters[col_idx]].width = 12
 
+    # Add legend for unmapped topics
+    if unmapped_in_data:
+        legend_row = len(data) + 3
+        ws.cell(row=legend_row, column=1, value="⚠️ Yellow-highlighted topics are unmapped (not in canonical list)")
+        ws.cell(row=legend_row, column=1).font = Font(italic=True, color="FF6B35")
+
     # Save
     wb.save(output_file)
     print(f"✓ Report saved to {output_file}")
+    
+    if unmapped_in_data:
+        print(f"  Note: {len(unmapped_in_data)} unmapped topics highlighted in yellow")
 
 
 def main():
@@ -945,12 +1051,26 @@ def main():
         all_extracted_topics.extend(topics)
 
     canonical_mapping = consolidate_topics(all_extracted_topics)
+    
+    # Debug: Print canonical topics
+    print(f"\n📋 Canonical Topics ({len(canonical_mapping)}):")
+    for idx, canonical in enumerate(sorted(canonical_mapping.keys()), 1):
+        variation_count = len(canonical_mapping[canonical])
+        print(f"  {idx}. {canonical} ({variation_count} variations)")
     print()
 
     # Phase 4: Generate Trend Matrix
     print("PHASE 4: Trend Analysis")
     print("-" * 40)
-    canonical_counts = map_topics_to_canonical(topics_by_date, canonical_mapping)
+    canonical_counts, unmapped_topics = map_topics_to_canonical(topics_by_date, canonical_mapping)
+    
+    # Debug: Print unmapped topics if any
+    if unmapped_topics:
+        print(f"\n⚠️  Found {len(unmapped_topics)} unmapped topics:")
+        for topic, suggestion in list(unmapped_topics.items())[:10]:
+            print(f"  - '{topic}' → suggested: '{suggestion}'")
+        if len(unmapped_topics) > 10:
+            print(f"  ... and {len(unmapped_topics) - 10} more")
     print()
 
     # Phase 5: Generate Report
@@ -959,7 +1079,7 @@ def main():
     # Extract app name from app_id (e.g., "in.swiggy.android" → "swiggy")
     app_name = app_id.split('.')[-2] if '.' in app_id else app_id
     output_file = OUTPUT_DIR / f"{app_name}_trend_report_{target_date.strftime('%Y-%m-%d')}.xlsx"
-    generate_trend_report(canonical_counts, target_date, str(output_file))
+    generate_trend_report(canonical_counts, target_date, str(output_file), canonical_mapping, unmapped_topics)
 
     print()
     print("=" * 60)

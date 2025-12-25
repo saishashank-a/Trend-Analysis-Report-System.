@@ -1,0 +1,57 @@
+/**
+ * Custom CSS (Minimal - Tailwind handles most styling)
+ * Only custom animations and specific tweaks
+ */
+
+/* Dark mode base styles */
+body {
+    background-color: #000000;
+    color: #ffffff;
+}
+
+/* Smooth scroll behavior */
+html {
+    scroll-behavior: smooth;
+}
+
+/* Custom scrollbar for webkit browsers - Dark Mode */
+::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+}
+
+::-webkit-scrollbar-track {
+    background: #0a0a0a;
+    border-radius: 5px;
+}
+
+::-webkit-scrollbar-thumb {
+    background: #1a1a1a;
+    border-radius: 5px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: #3b82f6;
+}
+
+/* Fade-in animation for results */
+@keyframes fadeIn {
+    from {
+        opacity: 0;
+        transform: translateY(10px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+.fade-in {
+    animation: fadeIn 0.5s ease-out;
+}
+
+/* Chart container responsive helper */
+canvas {
+    max-width: 100%;
+    height: auto !important;
+}

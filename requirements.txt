@@ -1,5 +1,15 @@
-anthropic>=0.18.0
+# LLM Dependencies
+requests>=2.31.0
+python-dotenv>=1.0.0
+
+# Optional: Cloud LLM providers (not required with Ollama)
+# anthropic>=0.18.0
+
+# App Dependencies
 google-play-scraper>=1.2.0
 pandas>=2.0.0
 openpyxl>=3.1.0
-python-dotenv>=1.0.0
+
+# Web Framework
+flask>=3.0.0
+flask-cors>=4.0.0

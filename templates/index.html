@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>App Store Review Trend Analysis</title>
+
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <!-- Chart.js CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+
+    <!-- Custom styles -->
+    <style>
+        @keyframes pulse-slow {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.6; }
+        }
+
+        .pulse-slow {
+            animation: pulse-slow 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+        }
+
+        .gradient-bg {
+            background: linear-gradient(135deg, #8b5cf6 0%, #3b82f6 50%, #06b6d4 100%);
+        }
+
+        .card-hover {
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        .card-hover:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 20px 25px -5px rgba(59, 130, 246, 0.3), 0 10px 10px -5px rgba(59, 130, 246, 0.2);
+        }
+    </style>
+</head>
+<body class="bg-black min-h-screen">
+    <!-- Header -->
+    <header class="gradient-bg text-white shadow-2xl">
+        <div class="container mx-auto px-4 py-6">
+            <h1 class="text-3xl font-bold flex items-center">
+                <svg class="w-8 h-8 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path>
+                </svg>
+                App Store Review Trend Analysis
+            </h1>
+            <p class="text-gray-300 mt-2">Analyze Google Play Store reviews and identify trending topics</p>
+        </div>
+    </header>
+
+    <div class="container mx-auto px-4 py-8">
+        <!-- Configuration Panel -->
+        <div class="bg-[#0a0a0a] border border-[#1a1a1a] rounded-lg shadow-2xl p-6 mb-6 card-hover">
+            <h2 class="text-2xl font-semibold text-white mb-4 flex items-center">
+                <svg class="w-6 h-6 mr-2 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path>
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
+                </svg>
+                Configuration
+            </h2>
+
+            <!-- LLM Status Indicator -->
+            <div id="llmStatusBanner" class="mb-4 hidden">
+                <!-- Will be populated by JavaScript -->
+            </div>
+
+            <form id="analysisForm" class="space-y-4">
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <!-- App ID Input -->
+                    <div>
+                        <label for="appId" class="block text-sm font-medium text-gray-300 mb-2">
+                            App Package ID or Play Store Link
+                        </label>
+                        <input
+                            type="text"
+                            id="appId"
+                            name="appId"
+                            placeholder="in.swiggy.android"
+                            class="w-full px-4 py-2 bg-[#111111] border border-[#1a1a1a] text-white rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent transition placeholder-gray-500"
+                            value="in.swiggy.android"
+                        />
+                        <p class="text-xs text-gray-500 mt-1">Default: Swiggy app</p>
+                    </div>
+
+                    <!-- Target Date Input -->
+                    <div>
+                        <label for="targetDate" class="block text-sm font-medium text-gray-300 mb-2">
+                            Target Date
+                        </label>
+                        <input
+                            type="date"
+                            id="targetDate"
+                            name="targetDate"
+                            class="w-full px-4 py-2 bg-[#111111] border border-[#1a1a1a] text-white rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent transition placeholder-gray-500"
+                        />
+                        <p class="text-xs text-gray-500 mt-1">Leave empty for today</p>
+                    </div>
+
+                    <!-- Days Input -->
+                    <div>
+                        <label for="days" class="block text-sm font-medium text-gray-300 mb-2">
+                            Analysis Period (Days)
+                        </label>
+                        <select
+                            id="days"
+                            name="days"
+                            class="w-full px-4 py-2 bg-[#111111] border border-[#1a1a1a] text-white rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent transition placeholder-gray-500"
+                        >
+                            <option value="7">7 days</option>
+                            <option value="14">14 days</option>
+                            <option value="30" selected>30 days</option>
+                            <option value="60">60 days</option>
+                            <option value="90">90 days</option>
+                        </select>
+                    </div>
+                </div>
+
+                <!-- Submit Button -->
+                <div class="flex justify-end">
+                    <button
+                        type="submit"
+                        id="startButton"
+                        class="bg-blue-600 hover:bg-blue-700 text-white font-semibold px-8 py-3 rounded-lg transition duration-200 flex items-center shadow-lg hover:shadow-xl"
+                    >
+                        <svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path>
+                        </svg>
+                        Start Analysis
+                    </button>
+                </div>
+            </form>
+        </div>
+
+        <!-- Progress Tracker (Hidden by default) -->
+        <div id="progressSection" class="bg-[#0a0a0a] border border-[#1a1a1a] rounded-lg shadow-2xl p-6 mb-6 hidden">
+            <h2 class="text-2xl font-semibold text-white mb-4 flex items-center">
+                <svg class="w-6 h-6 mr-2 text-blue-600 pulse-slow" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                </svg>
+                Analysis Progress
+            </h2>
+
+            <!-- Progress Bar -->
+            <div class="mb-6">
+                <div class="flex justify-between mb-2">
+                    <span class="text-sm font-medium text-gray-300" id="progressPhase">Initializing...</span>
+                    <span class="text-sm font-medium text-gray-300" id="progressPercent">0%</span>
+                </div>
+                <div class="w-full bg-[#1a1a1a] rounded-full h-4 overflow-hidden">
+                    <div id="progressBar" class="bg-purple-600 h-4 rounded-full transition-all duration-500" style="width: 0%"></div>
+                </div>
+                <p class="text-sm text-gray-400 mt-2" id="progressMessage">Starting analysis...</p>
+            </div>
+
+            <!-- Phase Checklist -->
+            <div class="space-y-3">
+                <div id="phase1" class="flex items-center text-gray-500">
+                    <span class="phase-icon mr-3">⏳</span>
+                    <span class="phase-text">Phase 1: Data Collection</span>
+                </div>
+                <div id="phase2" class="flex items-center text-gray-500">
+                    <span class="phase-icon mr-3">⏳</span>
+                    <span class="phase-text">Phase 2: Topic Extraction</span>
+                </div>
+                <div id="phase3" class="flex items-center text-gray-500">
+                    <span class="phase-icon mr-3">⏳</span>
+                    <span class="phase-text">Phase 3: Topic Consolidation</span>
+                </div>
+                <div id="phase4" class="flex items-center text-gray-500">
+                    <span class="phase-icon mr-3">⏳</span>
+                    <span class="phase-text">Phase 4: Trend Analysis</span>
+                </div>
+                <div id="phase5" class="flex items-center text-gray-500">
+                    <span class="phase-icon mr-3">⏳</span>
+                    <span class="phase-text">Phase 5: Report Generation</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Results Dashboard (Hidden by default) -->
+        <div id="resultsSection" class="hidden">
+            <!-- Summary Cards -->
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
+                <div class="bg-blue-600/20 backdrop-blur rounded-lg p-6 card-hover border border-blue-500/30">
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <p class="text-gray-400 text-sm">Total Reviews</p>
+                            <p class="text-white text-3xl font-bold" id="totalReviews">-</p>
+                        </div>
+                        <div class="bg-blue-600 rounded-full p-3">
+                            <svg class="w-8 h-8 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 8h10M7 12h4m1 8l-4-4H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-3l-4 4z"></path>
+                            </svg>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="bg-green-600/20 backdrop-blur rounded-lg p-6 card-hover border border-green-500/30">
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <p class="text-gray-400 text-sm">Topics Identified</p>
+                            <p class="text-white text-3xl font-bold" id="totalTopics">-</p>
+                        </div>
+                        <div class="bg-green-600 rounded-full p-3">
+                            <svg class="w-8 h-8 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 010 2.828l-7 7a2 2 0 01-2.828 0l-7-7A1.994 1.994 0 013 12V7a4 4 0 014-4z"></path>
+                            </svg>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="bg-purple-600/20 backdrop-blur rounded-lg p-6 card-hover border border-purple-500/30">
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <p class="text-gray-400 text-sm">Date Range</p>
+                            <p class="text-white text-lg font-bold" id="dateRange">-</p>
+                        </div>
+                        <div class="bg-purple-600 rounded-full p-3">
+                            <svg class="w-8 h-8 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path>
+                            </svg>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Download Button -->
+            <div class="bg-[#0a0a0a] border border-[#1a1a1a] rounded-lg shadow-2xl p-6 mb-6">
+                <div class="flex items-center justify-between">
+                    <div>
+                        <h3 class="text-xl font-semibold text-white">Excel Report</h3>
+                        <p class="text-gray-400 mt-1">Download the complete trend analysis report</p>
+                    </div>
+                    <button
+                        id="downloadButton"
+                        class="bg-green-600 hover:bg-green-700 text-white font-semibold px-6 py-3 rounded-lg transition duration-200 flex items-center shadow-lg hover:shadow-xl"
+                    >
+                        <svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path>
+                        </svg>
+                        Download Excel
+                    </button>
+                </div>
+            </div>
+
+            <!-- Topic Trends Line Chart -->
+            <div class="bg-[#0a0a0a] border border-[#1a1a1a] rounded-lg shadow-2xl p-6 mb-6">
+                <h3 class="text-xl font-semibold text-white mb-4">Topic Trends Over Time</h3>
+                <div class="relative" style="height: 400px;">
+                    <canvas id="lineChart"></canvas>
+                </div>
+            </div>
+
+            <!-- Top Topics Bar Chart -->
+            <div class="bg-[#0a0a0a] border border-[#1a1a1a] rounded-lg shadow-2xl p-6 mb-6">
+                <h3 class="text-xl font-semibold text-white mb-4">Top Topics by Frequency</h3>
+                <div class="relative" style="height: 400px;">
+                    <canvas id="barChart"></canvas>
+                </div>
+            </div>
+
+            <!-- Topics Table -->
+            <div class="bg-[#0a0a0a] border border-[#1a1a1a] rounded-lg shadow-2xl p-6">
+                <h3 class="text-xl font-semibold text-white mb-4">All Topics</h3>
+
+                <!-- Search/Filter -->
+                <div class="mb-4">
+                    <input
+                        type="text"
+                        id="tableSearch"
+                        placeholder="Search topics..."
+                        class="w-full px-4 py-2 bg-[#111111] border border-[#1a1a1a] text-white rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent placeholder-gray-500"
+                    />
+                </div>
+
+                <!-- Table -->
+                <div class="overflow-x-auto">
+                    <table class="min-w-full divide-y divide-[#1a1a1a]">
+                        <thead class="bg-[#111111]">
+                            <tr>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">#</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Topic</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Total Mentions</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Variations</th>
+                            </tr>
+                        </thead>
+                        <tbody id="topicsTableBody" class="divide-y divide-[#1a1a1a]">
+                            <!-- Table rows will be populated by JavaScript -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- Error Message (Hidden by default) -->
+        <div id="errorSection" class="bg-red-900/20 border border-red-500/50 rounded-lg p-6 mb-6 hidden">
+            <div class="flex items-start">
+                <svg class="w-6 h-6 text-red-500 mr-3 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                </svg>
+                <div>
+                    <h3 class="text-lg font-semibold text-red-400 mb-2">Analysis Failed</h3>
+                    <p id="errorMessage" class="text-red-300"></p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Footer -->
+    <footer class="bg-[#0a0a0a] border-t border-[#1a1a1a] shadow-2xl mt-12">
+        <div class="container mx-auto px-4 py-6 text-center text-gray-400">
+            <p>Powered by Ollama (Qwen2.5 32B + Llama3.1 70B) | 100% Free & Local | Built with Flask, Tailwind CSS & Chart.js</p>
+        </div>
+    </footer>
+
+    <!-- Load Dashboard JavaScript -->
+    <script src="/static/js/dashboard.js"></script>
+</body>
+</html>
