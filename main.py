@@ -10,10 +10,20 @@ import sys
 import re
 import argparse
 import time
+import asyncio
+import multiprocessing
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Performance monitoring
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    print("Warning: psutil not available, using default concurrency settings")
 
 # Third-party imports
 import pandas as pd
@@ -26,10 +36,57 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Import LLM abstraction
-from config.llm_client import get_llm_client, OllamaClient
+from config.llm_client import get_llm_client, OllamaClient, AsyncOllamaClient
 
 # Initialize LLM client (Ollama or fallback)
 client = get_llm_client()
+
+
+def get_optimal_concurrency() -> dict:
+    """
+    Auto-detect optimal concurrency settings based on hardware
+
+    Returns:
+        dict with 'cpu_count', 'available_memory_gb', 'max_concurrent', 'batch_size'
+    """
+    cpu_count = multiprocessing.cpu_count()
+
+    # Get available memory
+    if PSUTIL_AVAILABLE:
+        available_memory_gb = psutil.virtual_memory().available / (1024**3)
+    else:
+        available_memory_gb = 8.0  # Conservative default
+
+    # Heuristics based on hardware capabilities
+    # Each worker needs ~500MB RAM for Ollama inference
+    max_workers_by_cpu = cpu_count * 2  # Hyperthreading benefit for async I/O
+    max_workers_by_memory = int(available_memory_gb / 0.5)
+
+    # Conservative: Take minimum to avoid OOM
+    recommended_workers = min(max_workers_by_cpu, max_workers_by_memory, 32)
+
+    # For async I/O, we can go higher than thread-based parallelism
+    recommended_concurrent = recommended_workers * 2
+
+    # Batch size: Smaller batches with more workers for better parallelism
+    if recommended_workers <= 8:
+        batch_size = 20
+    elif recommended_workers <= 16:
+        batch_size = 15
+    else:
+        batch_size = 10
+
+    # Allow environment variable overrides
+    config = {
+        'cpu_count': cpu_count,
+        'available_memory_gb': round(available_memory_gb, 1),
+        'max_workers': int(os.getenv('MAX_WORKERS', recommended_workers)),
+        'max_concurrent': int(os.getenv('MAX_CONCURRENT', recommended_concurrent)),
+        'batch_size': int(os.getenv('BATCH_SIZE', batch_size))
+    }
+
+    return config
+
 
 # Configuration
 SWIGGY_APP_ID = "in.swiggy.android"
@@ -383,6 +440,49 @@ def extract_topics_from_review(review_text: str) -> List[dict]:
         return extract_topics_heuristic(review_text)
 
 
+async def extract_topics_batch_async(reviews_batch: List[dict], async_client: AsyncOllamaClient) -> Dict[int, List[dict]]:
+    """Async version: Extract topics from a batch of reviews using a single LLM call."""
+    try:
+        # Switch to extraction model
+        async_client.set_extraction_mode()
+
+        # Build batch string (optimized for larger batches)
+        batch_str = ""
+        for idx, review in enumerate(reviews_batch):
+            content = review.get('content', '')
+            if content and len(content) >= 5:
+                # Truncate very long reviews to save tokens
+                truncated_content = content[:500] if len(content) > 500 else content
+                batch_str += f"\n{idx}. {truncated_content}\n"
+
+        if not batch_str:
+            return {}
+
+        prompt = BATCH_EXTRACTION_PROMPT.format(reviews_batch=batch_str)
+        response_text = await async_client.chat_async(prompt, max_tokens=6000, temperature=0.1)
+        result = async_client.extract_json(response_text)
+
+        # Parse results
+        topics_by_idx = {}
+        if 'reviews' in result:
+            for review_result in result['reviews']:
+                review_id = int(review_result.get('review_id', -1))
+                topics = review_result.get('topics', [])
+                if review_id >= 0 and isinstance(topics, list):
+                    topics_by_idx[review_id] = topics
+
+        return topics_by_idx
+
+    except Exception as e:
+        # Fallback: Extract individually using heuristics
+        result = {}
+        for idx, review in enumerate(reviews_batch):
+            content = review.get('content', '')
+            if content and len(content) >= 5:
+                result[idx] = extract_topics_heuristic(content)
+        return result
+
+
 def extract_topics_batch(reviews_batch: List[dict]) -> Dict[int, List[dict]]:
     """Extract topics from a batch of reviews using a single LLM call."""
     try:
@@ -467,6 +567,51 @@ def extract_topics_heuristic(review_text: str) -> List[dict]:
     return topics if topics else [{"topic": "General Review", "category": "feedback"}]
 
 
+async def process_batch_wrapper_async(args, async_client: AsyncOllamaClient):
+    """Async wrapper function for parallel batch processing."""
+    batch_id, batch, batch_start = args
+    try:
+        print(f"    → Processing batch {batch_id} ({len(batch)} reviews)...", flush=True)
+        batch_topics = await extract_topics_batch_async(batch, async_client)
+        # Collect topics from this batch
+        topics = []
+        for idx, review in enumerate(batch):
+            if idx in batch_topics:
+                extracted = batch_topics[idx]
+                for item in extracted:
+                    if isinstance(item, dict) and 'topic' in item:
+                        topics.append(item['topic'])
+        print(f"    ✓ Batch {batch_id} complete ({len(topics)} topics extracted)", flush=True)
+        return batch_id, topics, len(batch)
+    except Exception as e:
+        print(f"    ✗ Batch {batch_id} failed: {e}", flush=True)
+        return batch_id, [], len(batch)
+
+
+async def process_all_batches_async(batches: List[tuple], async_client: AsyncOllamaClient, max_concurrent: int = 16):
+    """Process all batches with async concurrency control"""
+    # Create semaphore to limit concurrent requests
+    semaphore = asyncio.Semaphore(max_concurrent)
+
+    async def bounded_process(batch_args):
+        async with semaphore:
+            return await process_batch_wrapper_async(batch_args, async_client)
+
+    # Process all batches concurrently
+    tasks = [bounded_process(batch_args) for batch_args in batches]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Filter out exceptions
+    valid_results = []
+    for result in results:
+        if isinstance(result, Exception):
+            print(f"    ✗ Batch failed with exception: {result}")
+        else:
+            valid_results.append(result)
+
+    return valid_results
+
+
 def process_batch_wrapper(args):
     """Wrapper function for parallel batch processing."""
     batch_id, batch, batch_start = args
@@ -488,44 +633,132 @@ def process_batch_wrapper(args):
         return batch_id, [], len(batch)
 
 
-def extract_all_topics(reviews_by_date: Dict[str, List[dict]], progress_callback=None) -> Dict[str, List[str]]:
+def extract_all_topics(reviews_by_date: Dict[str, List[dict]], progress_callback=None, job_id=None) -> Dict[str, List[str]]:
     """
-    Extract topics from all reviews using optimized parallel batch processing.
+    Extract topics from all reviews using ASYNC parallel batch processing with request pipelining.
 
     Args:
         reviews_by_date: Mapping of date strings to lists of review dictionaries
         progress_callback: Optional function(processed, total) to report progress
+        job_id: Optional job ID for cancellation support
 
     Returns mapping of date -> list of unique topics.
     """
-    print("Extracting topics from reviews (using parallel batch processing)...")
+    print("Extracting topics from reviews (using ASYNC parallel batch processing with REQUEST PIPELINING)...")
     topics_by_date = {}
     total_reviews = sum(len(reviews) for reviews in reviews_by_date.values())
 
-    # OPTIMIZED settings for Build tier (50 RPM)
-    BATCH_SIZE = 20  # 20 reviews per batch
-    MAX_WORKERS = 8  # 8 parallel workers for faster processing
+    # AUTO-DETECT optimal settings
+    hw_config = get_optimal_concurrency()
+    BATCH_SIZE = hw_config['batch_size']
+    MAX_CONCURRENT = hw_config['max_concurrent']
+
+    print(f"  Hardware detected:")
+    print(f"    CPUs: {hw_config['cpu_count']} cores")
+    print(f"    Available RAM: {hw_config['available_memory_gb']} GB")
+    print(f"  Optimized configuration:")
+    print(f"    Batch size: {BATCH_SIZE} reviews/batch")
+    print(f"    Concurrent requests: {MAX_CONCURRENT}")
+    print(f"  Total reviews: {total_reviews}")
+
+    # Try to use async client, fall back to sync if not available
+    try:
+        # Create async client with caching enabled
+        enable_cache = os.getenv('ENABLE_CACHE', 'true').lower() == 'true'
+        async_client = AsyncOllamaClient(
+            base_url=os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434'),
+            extraction_model=os.getenv('OLLAMA_EXTRACTION_MODEL', 'qwen2.5:7b'),
+            consolidation_model=os.getenv('OLLAMA_CONSOLIDATION_MODEL', 'llama3.1:8b'),
+            max_connections=MAX_CONCURRENT,
+            enable_cache=enable_cache
+        )
+
+        start_time = time.time()
+        processed = 0
+
+        # PHASE 3: REQUEST PIPELINING - Build ALL batches across ALL dates upfront
+        print("  Building global batch pipeline...")
+        all_batches = []
+        date_batch_mapping = {}
+        global_batch_id = 0
+
+        for date_str in sorted(reviews_by_date.keys()):
+            date_reviews = reviews_by_date[date_str]
+            date_batch_ids = []
+
+            for batch_start in range(0, len(date_reviews), BATCH_SIZE):
+                batch_end = min(batch_start + BATCH_SIZE, len(date_reviews))
+                batch = date_reviews[batch_start:batch_end]
+                all_batches.append((global_batch_id, batch, batch_start))
+                date_batch_ids.append(global_batch_id)
+                global_batch_id += 1
+
+            date_batch_mapping[date_str] = date_batch_ids
+
+        total_batches = len(all_batches)
+        print(f"  Total batches in pipeline: {total_batches}")
+        print(f"  Estimated time: ~{int(total_batches / MAX_CONCURRENT * 2)} seconds\n")
+
+        # Process ALL batches in one continuous async pipeline
+        async_client.set_extraction_mode()
+        all_results = asyncio.run(process_all_batches_async(all_batches, async_client, MAX_CONCURRENT))
+
+        # Organize results back by date
+        results_dict = {batch_id: (topics, size) for batch_id, topics, size in all_results}
+
+        for date_str, batch_ids in date_batch_mapping.items():
+            date_topics = []
+            for batch_id in batch_ids:
+                if batch_id in results_dict:
+                    topics, batch_size = results_dict[batch_id]
+                    date_topics.extend(topics)
+                    processed += batch_size
+
+                    # Call progress callback if provided
+                    if progress_callback and processed % 50 == 0:
+                        progress_callback(processed, total_reviews)
+
+            if date_topics:
+                topics_by_date[date_str] = date_topics
+
+        # Cleanup async client
+        asyncio.run(async_client.close())
+
+        # Final callback
+        if progress_callback:
+            progress_callback(total_reviews, total_reviews)
+
+        total_time = time.time() - start_time
+        print(f"✓ Extracted topics from {processed} reviews using ASYNC PIPELINED processing")
+        print(f"  Total time: {int(total_time)} seconds ({total_time/60:.1f} minutes)")
+        print(f"  Average rate: {int(processed/total_time)} reviews/second")
+
+        # Show cache stats if caching was enabled
+        if enable_cache and async_client.cache:
+            cache_stats = async_client.cache.get_stats()
+            print(f"  Cache stats: {cache_stats['total_hits']} hits / {cache_stats['total_entries']} entries")
+
+        return topics_by_date
+
+    except Exception as e:
+        print(f"Warning: Async processing failed ({e}), falling back to synchronous processing")
+        # Fall back to original synchronous implementation
+        return extract_all_topics_sync(reviews_by_date, progress_callback)
+
+
+def extract_all_topics_sync(reviews_by_date: Dict[str, List[dict]], progress_callback=None) -> Dict[str, List[str]]:
+    """Synchronous fallback version of topic extraction"""
+    print("Extracting topics from reviews (using synchronous parallel batch processing)...")
+    topics_by_date = {}
+    total_reviews = sum(len(reviews) for reviews in reviews_by_date.values())
+
+    BATCH_SIZE = 20
+    MAX_WORKERS = 8
 
     print(f"  Configuration: {BATCH_SIZE} reviews/batch, {MAX_WORKERS} parallel workers")
     print(f"  Total reviews: {total_reviews}")
-    estimated_batches = (total_reviews // BATCH_SIZE) + 1
-    print(f"  Total batches: {estimated_batches}")
-    print(f"  Note: This will take ~{int(estimated_batches / MAX_WORKERS * 3)} seconds (API dependent)\n")
 
     start_time = time.time()
-
-    # Calculate dynamic progress interval
-    if total_reviews <= 100:
-        progress_interval = 10
-    elif total_reviews <= 500:
-        progress_interval = 50
-    elif total_reviews <= 1000:
-        progress_interval = 100
-    elif total_reviews <= 2000:
-        progress_interval = 200
-    else:
-        progress_interval = max(total_reviews // 10, 500)
-
     processed = 0
 
     for date_str in sorted(reviews_by_date.keys()):
@@ -543,35 +776,25 @@ def extract_all_topics(reviews_by_date: Dict[str, List[dict]], progress_callback
         # Process batches in parallel
         date_topics = []
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            # Submit all batches for parallel processing
             futures = {executor.submit(process_batch_wrapper, batch_args): batch_args[0]
                       for batch_args in batches}
 
-            # Collect results as they complete
             for future in as_completed(futures):
                 batch_id, topics, batch_size = future.result()
                 date_topics.extend(topics)
                 processed += batch_size
 
-                # Call progress callback if provided
-                if progress_callback and processed % 50 == 0:  # Update every 50 reviews
+                if progress_callback and processed % 50 == 0:
                     progress_callback(processed, total_reviews)
-
-                if processed % progress_interval == 0:
-                    elapsed = time.time() - start_time
-                    rate = processed / elapsed if elapsed > 0 else 0
-                    remaining = (total_reviews - processed) / rate if rate > 0 else 0
-                    print(f"  Processed {processed}/{total_reviews} reviews | Elapsed: {int(elapsed)}s | ETA: {int(remaining)}s | Rate: {int(rate)}/s")
 
         if date_topics:
             topics_by_date[date_str] = date_topics
 
-    # Final callback
     if progress_callback:
         progress_callback(total_reviews, total_reviews)
 
     total_time = time.time() - start_time
-    print(f"✓ Extracted topics from {processed} reviews using ULTRA-FAST parallel processing")
+    print(f"✓ Extracted topics from {processed} reviews")
     print(f"  Total time: {int(total_time)} seconds ({total_time/60:.1f} minutes)")
     print(f"  Average rate: {int(processed/total_time)} reviews/second")
     return topics_by_date

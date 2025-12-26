@@ -17,39 +17,54 @@ from main import (
     map_topics_to_canonical, generate_trend_report, extract_app_id_from_link,
     SWIGGY_APP_ID, OUTPUT_DIR
 )
+from config.cache_db import JobDatabase
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for local development
 
-# Job storage (in-memory - use Redis for production)
-jobs = {}
-jobs_lock = threading.Lock()
+# Initialize persistent job database
+job_db = JobDatabase()
+
+# Cancellation flags for active jobs
+cancel_flags = {}
+cancel_flags_lock = threading.Lock()
+
+
+def is_job_cancelled(job_id: str) -> bool:
+    """Check if job has been cancelled"""
+    with cancel_flags_lock:
+        if job_id in cancel_flags:
+            return cancel_flags[job_id].is_set()
+    return False
 
 
 def update_job_progress(job_id, phase, progress_pct, message, status="running", metrics=None):
     """
-    Update job progress in shared state
+    Update job progress in database
 
     Args:
         metrics (dict, optional): Additional progress metrics like:
             - processed: int - items processed so far
             - total: int - total items to process
     """
-    with jobs_lock:
-        if job_id in jobs:
-            update_data = {
-                'status': status,
-                'phase': phase,
-                'progress_pct': progress_pct,
-                'message': message,
-                'updated_at': datetime.now().isoformat()
-            }
+    updates = {
+        'status': status,
+        'phase': phase,
+        'progress_pct': progress_pct,
+        'message': message
+    }
 
-            # Add metrics if provided
-            if metrics:
-                update_data['metrics'] = metrics
+    # Add metrics if provided
+    if metrics:
+        updates['metrics'] = json.dumps(metrics)
 
-            jobs[job_id].update(update_data)
+    # Add completion timestamp if completed
+    if status == 'completed':
+        updates['completed_at'] = datetime.now().isoformat()
+    elif status == 'failed':
+        updates['error'] = message
+
+    job_db.update_job(job_id, updates)
 
 
 def run_analysis_job(job_id, app_id, target_date, days):
@@ -142,29 +157,40 @@ def run_analysis_job(job_id, app_id, target_date, days):
         # Prepare results data for charts
         results_data = prepare_results_data(canonical_counts, canonical_mapping, target_date, days)
 
-        # Mark job as complete
-        with jobs_lock:
-            jobs[job_id].update({
-                'status': 'completed',
-                'phase': 'Complete',
-                'progress_pct': 100,
-                'message': 'Analysis complete!',
-                'result_file': str(output_file),
-                'results_data': results_data,
-                'completed_at': datetime.now().isoformat()
+        # Mark job as complete in database
+        job_db.update_job(job_id, {
+            'status': 'completed',
+            'phase': 'Complete',
+            'progress_pct': 100,
+            'message': 'Analysis complete!',
+            'result_file': str(output_file),
+            'results_data': json.dumps(results_data),
+            'completed_at': datetime.now().isoformat()
             })
 
     except Exception as e:
-        # Mark job as failed
-        with jobs_lock:
-            jobs[job_id].update({
-                'status': 'failed',
-                'phase': 'Error',
-                'progress_pct': 0,
-                'message': str(e),
-                'error': str(e),
-                'failed_at': datetime.now().isoformat()
-            })
+        # Check if it was cancelled
+        error_msg = str(e)
+        if is_job_cancelled(job_id) or "cancelled" in error_msg.lower():
+            status = 'cancelled'
+            phase = 'Cancelled'
+        else:
+            status = 'failed'
+            phase = 'Error'
+
+        # Mark job as failed or cancelled in database
+        job_db.update_job(job_id, {
+            'status': status,
+            'phase': phase,
+            'progress_pct': 0,
+            'message': error_msg,
+            'error': error_msg
+        })
+    finally:
+        # Cleanup cancellation flag
+        with cancel_flags_lock:
+            if job_id in cancel_flags:
+                del cancel_flags[job_id]
 
 
 def prepare_results_data(canonical_counts, canonical_mapping, target_date, days):
@@ -303,18 +329,21 @@ def start_analysis():
         # Create job
         job_id = str(uuid.uuid4())
 
-        with jobs_lock:
-            jobs[job_id] = {
-                'job_id': job_id,
-                'status': 'started',
-                'phase': 'Initializing',
-                'progress_pct': 0,
-                'message': 'Starting analysis...',
-                'app_id': app_id,
-                'target_date': target_date.isoformat(),
-                'days': days,
-                'created_at': datetime.now().isoformat()
-            }
+        # Create job in database
+        job_db.create_job({
+            'job_id': job_id,
+            'status': 'started',
+            'phase': 'Initializing',
+            'message': 'Starting analysis...',
+            'app_id': app_id,
+            'app_name': data.get('app_name'),  # Optional app name
+            'target_date': target_date.isoformat(),
+            'days': days
+        })
+
+        # Register cancellation flag
+        with cancel_flags_lock:
+            cancel_flags[job_id] = threading.Event()
 
         # Start background job
         thread = threading.Thread(
@@ -337,58 +366,53 @@ def start_analysis():
 @app.route('/api/status/<job_id>', methods=['GET'])
 def get_job_status(job_id):
     """Get the current status of a job"""
-    with jobs_lock:
-        if job_id not in jobs:
-            return jsonify({'error': 'Job not found'}), 404
+    job = job_db.get_job(job_id)
+    if not job:
+        return jsonify({'error': 'Job not found'}), 404
 
-        job = jobs[job_id].copy()
-        # Remove large data from status response
-        if 'results_data' in job:
-            job.pop('results_data')
+    # Remove large data from status response
+    if 'results_data' in job:
+        job.pop('results_data')
 
-        return jsonify(job)
+    return jsonify(job)
 
 
 @app.route('/api/results/<job_id>', methods=['GET'])
 def get_job_results(job_id):
     """Get the results data for charts"""
-    with jobs_lock:
-        if job_id not in jobs:
-            return jsonify({'error': 'Job not found'}), 404
+    job = job_db.get_job(job_id)
+    if not job:
+        return jsonify({'error': 'Job not found'}), 404
 
-        job = jobs[job_id]
+    if job['status'] != 'completed':
+        return jsonify({'error': 'Job not completed yet'}), 400
 
-        if job['status'] != 'completed':
-            return jsonify({'error': 'Job not completed yet'}), 400
+    if 'results_data' not in job or not job['results_data']:
+        return jsonify({'error': 'Results data not available'}), 404
 
-        if 'results_data' not in job:
-            return jsonify({'error': 'Results data not available'}), 404
-
-        return jsonify(job['results_data'])
+    return jsonify(job['results_data'])
 
 
 @app.route('/api/download/<job_id>', methods=['GET'])
 def download_report(job_id):
     """Download the Excel report for a completed job"""
-    with jobs_lock:
-        if job_id not in jobs:
-            return jsonify({'error': 'Job not found'}), 404
+    job = job_db.get_job(job_id)
+    if not job:
+        return jsonify({'error': 'Job not found'}), 404
 
-        job = jobs[job_id]
+    if job['status'] != 'completed':
+        return jsonify({'error': 'Job not completed yet'}), 400
 
-        if job['status'] != 'completed':
-            return jsonify({'error': 'Job not completed yet'}), 400
+    if 'result_file' not in job or not job['result_file']:
+        return jsonify({'error': 'Result file not available'}), 404
 
-        if 'result_file' not in job:
-            return jsonify({'error': 'Result file not available'}), 404
+    result_file = job['result_file']
 
-        result_file = job['result_file']
+    if not os.path.exists(result_file):
+        return jsonify({'error': 'Result file not found on disk'}), 404
 
-        if not os.path.exists(result_file):
-            return jsonify({'error': 'Result file not found on disk'}), 404
-
-        return send_file(
-            result_file,
+    return send_file(
+        result_file,
             as_attachment=True,
             download_name=os.path.basename(result_file),
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
@@ -398,16 +422,123 @@ def download_report(job_id):
 @app.route('/api/jobs', methods=['GET'])
 def list_jobs():
     """List all jobs (for debugging/admin)"""
-    with jobs_lock:
-        jobs_list = []
-        for job_id, job in jobs.items():
-            job_copy = job.copy()
-            # Remove large data
-            if 'results_data' in job_copy:
-                job_copy.pop('results_data')
-            jobs_list.append(job_copy)
+    jobs_list = job_db.get_job_history(limit=100)
+    # Remove large data
+    for job in jobs_list:
+        if 'results_data' in job:
+            job.pop('results_data')
+    return jsonify({'jobs': jobs_list})
 
-        return jsonify({'jobs': jobs_list})
+
+@app.route('/api/history', methods=['GET'])
+def get_job_history():
+    """Get job history"""
+    limit = int(request.args.get('limit', 50))
+    offset = int(request.args.get('offset', 0))
+    status = request.args.get('status')  # Optional filter by status
+
+    history = job_db.get_job_history(limit, offset, status)
+    return jsonify({
+        'jobs': history,
+        'limit': limit,
+        'offset': offset
+    })
+
+
+@app.route('/api/job/<job_id>', methods=['GET'])
+def get_job_details(job_id):
+    """Get full job details including results"""
+    job = job_db.get_job(job_id)
+    if not job:
+        return jsonify({'error': 'Job not found'}), 404
+    return jsonify(job)
+
+
+@app.route('/api/cancel/<job_id>', methods=['POST'])
+def cancel_job(job_id):
+    """Cancel a running job"""
+    # Mark in database
+    job_db.cancel_job(job_id)
+
+    # Set cancellation flag
+    with cancel_flags_lock:
+        if job_id in cancel_flags:
+            cancel_flags[job_id].set()
+            return jsonify({'success': True, 'message': 'Job cancellation requested'})
+        else:
+            # Job might already be completed or not found
+            return jsonify({'success': True, 'message': 'Job marked as cancelled'})
+
+
+@app.route('/api/delete/<job_id>', methods=['DELETE'])
+def delete_job(job_id):
+    """Delete a job from history"""
+    try:
+        job = job_db.get_job(job_id)
+        if not job:
+            return jsonify({'error': 'Job not found'}), 404
+
+        # Don't allow deleting running jobs
+        if job['status'] in ['running', 'started']:
+            return jsonify({'error': 'Cannot delete a running job. Cancel it first.'}), 400
+
+        job_db.delete_job(job_id)
+        return jsonify({'success': True, 'message': 'Job deleted successfully'})
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/chat/<job_id>', methods=['POST'])
+def chat_with_results(job_id):
+    """Answer questions about analysis results using LLM"""
+    try:
+        data = request.json
+        user_question = data.get('question', '')
+
+        if not user_question:
+            return jsonify({'error': 'No question provided'}), 400
+
+        # Get job results
+        job = job_db.get_job(job_id)
+        if not job or job['status'] != 'completed':
+            return jsonify({'error': 'Job not found or not completed'}), 404
+
+        # Prepare context from results
+        results_summary = "Analysis results:\n"
+        if job.get('results_data'):
+            results_data = job['results_data']
+            if isinstance(results_data, str):
+                results_data = json.loads(results_data)
+
+            # Add top topics summary
+            if 'top_topics' in results_data:
+                results_summary += "\nTop Topics:\n"
+                for topic in results_data['top_topics'][:10]:
+                    results_summary += f"- {topic.get('topic', 'N/A')}: {topic.get('count', 0)} mentions\n"
+
+        # Query LLM
+        from config.llm_client import get_llm_client
+        llm_client = get_llm_client()
+
+        prompt = f"""You are analyzing app review trends. Here's the analysis data:
+
+{results_summary}
+
+User question: {user_question}
+
+Provide a clear, concise answer based on the data above. If the question cannot be answered with the available data, say so."""
+
+        response = llm_client.chat(prompt, max_tokens=500)
+
+        return jsonify({
+            'question': user_question,
+            'answer': response,
+            'timestamp': datetime.now().isoformat()
+        })
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/health/llm', methods=['GET'])

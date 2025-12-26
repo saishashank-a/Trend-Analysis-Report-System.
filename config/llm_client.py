@@ -7,8 +7,15 @@ import os
 import json
 import re
 import requests
+import asyncio
 from enum import Enum
 from typing import List, Dict, Any, Optional
+
+try:
+    import httpx
+    HTTPX_AVAILABLE = True
+except ImportError:
+    HTTPX_AVAILABLE = False
 
 
 class LLMProvider(Enum):
@@ -149,6 +156,118 @@ class OllamaClient(BaseLLMClient):
                 'message': f'Cannot reach Ollama: {str(e)}',
                 'instructions': 'Make sure Ollama is installed and running'
             }
+
+
+class AsyncOllamaClient(BaseLLMClient):
+    """Async Ollama client for high-performance batch processing"""
+
+    def __init__(
+        self,
+        base_url: str = "http://localhost:11434",
+        extraction_model: str = "qwen2.5:32b",
+        consolidation_model: str = "llama3.1:70b",
+        max_connections: int = 20,
+        enable_cache: bool = False
+    ):
+        if not HTTPX_AVAILABLE:
+            raise ImportError("httpx not installed. Run: pip install 'httpx[http2]'")
+
+        self.base_url = base_url
+        self.extraction_model = extraction_model
+        self.consolidation_model = consolidation_model
+        self.current_model = extraction_model
+        self.max_connections = max_connections
+
+        # Lazy initialization of async client
+        self._client = None
+
+        # Optional caching layer
+        self.cache = None
+        if enable_cache:
+            try:
+                from config.cache_db import LLMCache
+                self.cache = LLMCache()
+            except ImportError:
+                print("Warning: cache_db not available, caching disabled")
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        """Lazy initialization of async HTTP client"""
+        if self._client is None:
+            limits = httpx.Limits(
+                max_connections=self.max_connections,
+                max_keepalive_connections=self.max_connections
+            )
+            self._client = httpx.AsyncClient(
+                limits=limits,
+                timeout=httpx.Timeout(300.0),
+                http2=True  # Enable HTTP/2 for better performance
+            )
+        return self._client
+
+    def set_extraction_mode(self):
+        """Switch to extraction model (fast, bulk processing)"""
+        self.current_model = self.extraction_model
+
+    def set_consolidation_mode(self):
+        """Switch to consolidation model (high quality, single use)"""
+        self.current_model = self.consolidation_model
+
+    async def chat_async(self, prompt: str, max_tokens: int = 500, temperature: float = 0.1) -> str:
+        """Async chat request to Ollama API"""
+
+        # Check cache first
+        if self.cache:
+            cached = self.cache.get(prompt, self.current_model)
+            if cached:
+                return cached
+
+        try:
+            client = await self._get_client()
+
+            response = await client.post(
+                f"{self.base_url}/api/generate",
+                json={
+                    "model": self.current_model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "num_predict": max_tokens,
+                        "temperature": temperature
+                    }
+                }
+            )
+
+            if response.status_code != 200:
+                raise Exception(f"Ollama API error: {response.status_code} - {response.text}")
+
+            result = response.json()
+            result_text = result.get('response', '')
+
+            # Store in cache
+            if self.cache:
+                self.cache.set(prompt, self.current_model, result_text)
+
+            return result_text
+
+        except httpx.ConnectError:
+            raise Exception(
+                "Could not connect to Ollama. Make sure Ollama is running:\n"
+                "  1. Install from https://ollama.com/download\n"
+                "  2. Open the Ollama app\n"
+                "  3. Pull models: ollama pull qwen2.5:32b && ollama pull llama3.1:70b"
+            )
+        except Exception as e:
+            raise Exception(f"Ollama error: {str(e)}")
+
+    def chat(self, prompt: str, max_tokens: int = 500, temperature: float = 0.1) -> str:
+        """Synchronous wrapper for backward compatibility"""
+        return asyncio.run(self.chat_async(prompt, max_tokens, temperature))
+
+    async def close(self):
+        """Close the async client"""
+        if self._client:
+            await self._client.aclose()
+            self._client = None
 
 
 class AnthropicClient(BaseLLMClient):

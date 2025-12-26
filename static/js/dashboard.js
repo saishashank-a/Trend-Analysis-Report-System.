@@ -1,6 +1,6 @@
 /**
- * Dashboard JavaScript
- * Handles form submission, progress tracking, and results visualization
+ * Dashboard JavaScript - ChatGPT-like Interface
+ * Handles history, progress tracking, chat, and results visualization
  */
 
 // Global state
@@ -8,13 +8,17 @@ let currentJobId = null;
 let pollInterval = null;
 let lineChartInstance = null;
 let barChartInstance = null;
+let chatHistory = [];
+let sidebarVisible = true;
 
 // DOM Elements
 const form = document.getElementById('analysisForm');
 const startButton = document.getElementById('startButton');
-const progressSection = document.getElementById('progressSection');
-const resultsSection = document.getElementById('resultsSection');
-const errorSection = document.getElementById('errorSection');
+const configPanel = document.getElementById('configPanel');
+const progressPanel = document.getElementById('progressPanel');
+const resultsPanel = document.getElementById('resultsPanel');
+const errorPanel = document.getElementById('errorPanel');
+const historySidebar = document.getElementById('historySidebar');
 
 // Initialize
 document.addEventListener('DOMContentLoaded', () => {
@@ -22,18 +26,204 @@ document.addEventListener('DOMContentLoaded', () => {
     const today = new Date().toISOString().split('T')[0];
     document.getElementById('targetDate').value = today;
 
-    // Form submission handler
+    // Load job history
+    loadJobHistory();
+
+    // Refresh history every 10 seconds
+    setInterval(loadJobHistory, 10000);
+
+    // Event handlers
     form.addEventListener('submit', handleFormSubmit);
-
-    // Download button handler
+    document.getElementById('newAnalysisBtn').addEventListener('click', showConfigPanel);
+    document.getElementById('toggleSidebarBtn').addEventListener('click', toggleSidebar);
     document.getElementById('downloadButton').addEventListener('click', handleDownload);
-
-    // Table search handler
     document.getElementById('tableSearch').addEventListener('input', handleTableSearch);
 
-    // Check LLM status on page load
-    checkLLMStatus();
+    // History search
+    document.getElementById('historySearch').addEventListener('input', handleHistorySearch);
 });
+
+/**
+ * Load and display job history
+ */
+async function loadJobHistory() {
+    try {
+        const response = await fetch('/api/history?limit=50');
+        const data = await response.json();
+
+        renderHistoryList(data.jobs);
+    } catch (error) {
+        console.error('Failed to load history:', error);
+    }
+}
+
+/**
+ * Render history list in sidebar
+ */
+function renderHistoryList(jobs) {
+    const historyList = document.getElementById('historyList');
+
+    if (!jobs || jobs.length === 0) {
+        historyList.innerHTML = `
+            <div class="text-center text-gray-600 text-sm py-8">
+                No history yet
+            </div>
+        `;
+        return;
+    }
+
+    const statusColors = {
+        'completed': 'text-green-500',
+        'failed': 'text-red-500',
+        'running': 'text-blue-500',
+        'cancelled': 'text-gray-500',
+        'started': 'text-blue-500'
+    };
+
+    const statusIcons = {
+        'completed': '✓',
+        'failed': '✕',
+        'running': '⏳',
+        'cancelled': '□',
+        'started': '⏳'
+    };
+
+    historyList.innerHTML = jobs.map(job => `
+        <div
+            class="group p-3 mb-2 rounded-lg cursor-pointer transition-all relative ${
+                currentJobId === job.job_id ? 'bg-[#1a1a1a] border border-[#2a2a2a]' : 'hover:bg-[#1a1a1a]'
+            }"
+            onclick="loadJobById('${job.job_id}')"
+        >
+            <div class="flex items-start justify-between mb-1">
+                <div class="flex-1 min-w-0 pr-2">
+                    <div class="text-sm font-medium text-white truncate">
+                        ${escapeHtml(job.app_name || job.app_id)}
+                    </div>
+                    <div class="text-xs text-gray-500 mt-0.5">
+                        ${formatDate(job.created_at)}
+                    </div>
+                </div>
+                <div class="flex items-center gap-2">
+                    <div class="${statusColors[job.status]} text-xs font-medium ${
+                        job.status === 'running' ? 'status-running' : ''
+                    }">
+                        ${statusIcons[job.status]}
+                    </div>
+                    ${job.status !== 'running' && job.status !== 'started' ? `
+                        <button
+                            onclick="event.stopPropagation(); deleteJobById('${job.job_id}')"
+                            class="opacity-0 group-hover:opacity-100 transition-opacity p-1 hover:bg-red-600/20 rounded"
+                            title="Delete"
+                        >
+                            <svg class="w-4 h-4 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path>
+                            </svg>
+                        </button>
+                    ` : ''}
+                </div>
+            </div>
+            ${job.status === 'running' && job.progress_pct ? `
+                <div class="mt-2">
+                    <div class="w-full bg-[#0a0a0a] rounded-full h-1">
+                        <div class="h-1 rounded-full bg-blue-600" style="width: ${job.progress_pct}%"></div>
+                    </div>
+                </div>
+            ` : ''}
+        </div>
+    `).join('');
+}
+
+/**
+ * Load job by ID
+ */
+async function loadJobById(jobId) {
+    try {
+        const response = await fetch(`/api/job/${jobId}`);
+        const job = await response.json();
+
+        currentJobId = jobId;
+
+        if (job.status === 'running' || job.status === 'started') {
+            // Show progress panel and start polling
+            showProgressPanel();
+            startPolling();
+        } else if (job.status === 'completed') {
+            // Load and display results
+            await loadResults();
+        } else if (job.status === 'failed') {
+            showError(job.error || 'Job failed');
+        } else if (job.status === 'cancelled') {
+            showError('Job was cancelled');
+        }
+    } catch (error) {
+        showError('Failed to load job: ' + error.message);
+    }
+}
+
+/**
+ * Delete job by ID
+ */
+async function deleteJobById(jobId) {
+    if (!confirm('Are you sure you want to delete this analysis? This cannot be undone.')) {
+        return;
+    }
+
+    try {
+        const response = await fetch(`/api/delete/${jobId}`, {
+            method: 'DELETE'
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+            throw new Error(data.error || 'Failed to delete job');
+        }
+
+        // Show success message
+        showToast('Analysis deleted successfully', 'info');
+
+        // If the deleted job is currently displayed, go back to config
+        if (currentJobId === jobId) {
+            showConfigPanel();
+        }
+
+        // Refresh history
+        loadJobHistory();
+
+    } catch (error) {
+        showToast(error.message, 'error');
+    }
+}
+
+/**
+ * Handle history search
+ */
+function handleHistorySearch(e) {
+    const searchTerm = e.target.value.toLowerCase();
+    const historyItems = document.querySelectorAll('#historyList > div');
+
+    historyItems.forEach(item => {
+        const text = item.textContent.toLowerCase();
+        if (text.includes(searchTerm)) {
+            item.style.display = '';
+        } else {
+            item.style.display = 'none';
+        }
+    });
+}
+
+/**
+ * Toggle sidebar visibility
+ */
+function toggleSidebar() {
+    sidebarVisible = !sidebarVisible;
+    if (sidebarVisible) {
+        historySidebar.classList.remove('hidden');
+    } else {
+        historySidebar.classList.add('hidden');
+    }
+}
 
 /**
  * Handle form submission
@@ -52,19 +242,11 @@ async function handleFormSubmit(e) {
         return;
     }
 
-    // Hide error and results, show progress
-    hideError();
-    hideResults();
-    showProgress();
+    // Show progress
+    showProgressPanel();
 
     // Disable form
     startButton.disabled = true;
-    startButton.innerHTML = `
-        <svg class="animate-spin w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
-        </svg>
-        Processing...
-    `;
 
     try {
         // Start analysis
@@ -74,7 +256,7 @@ async function handleFormSubmit(e) {
                 'Content-Type': 'application/json',
             },
             body: JSON.stringify({
-                app_id: appId,
+                app_link: appId,
                 target_date: targetDate,
                 days: days
             })
@@ -90,6 +272,12 @@ async function handleFormSubmit(e) {
         currentJobId = data.job_id;
         startPolling();
 
+        // Add stop button
+        addStopButton();
+
+        // Refresh history
+        loadJobHistory();
+
     } catch (error) {
         console.error('Error starting analysis:', error);
         showError(error.message);
@@ -98,10 +286,55 @@ async function handleFormSubmit(e) {
 }
 
 /**
+ * Add stop button to top actions
+ */
+function addStopButton() {
+    const topActions = document.getElementById('topActions');
+    topActions.innerHTML = `
+        <button
+            onclick="cancelCurrentJob()"
+            class="px-4 py-2 bg-red-600 hover:bg-red-700 text-white text-sm rounded-lg transition-all flex items-center gap-2"
+        >
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+            </svg>
+            Stop
+        </button>
+    `;
+}
+
+/**
+ * Cancel current job
+ */
+async function cancelCurrentJob() {
+    if (!currentJobId) return;
+
+    if (!confirm('Are you sure you want to stop this analysis? Progress will be lost.')) {
+        return;
+    }
+
+    try {
+        const response = await fetch(`/api/cancel/${currentJobId}`, {
+            method: 'POST'
+        });
+
+        if (response.ok) {
+            stopPolling();
+            showToast('Analysis cancelled', 'warning');
+            setTimeout(() => {
+                showConfigPanel();
+                loadJobHistory();
+            }, 1500);
+        }
+    } catch (error) {
+        showError('Failed to cancel job: ' + error.message);
+    }
+}
+
+/**
  * Start polling for job status
  */
 function startPolling() {
-    // Poll every 2 seconds
     pollInterval = setInterval(async () => {
         try {
             const response = await fetch(`/api/status/${currentJobId}`);
@@ -117,16 +350,27 @@ function startPolling() {
             // Check if job is complete
             if (data.status === 'completed') {
                 stopPolling();
+                removeStopButton();
                 await loadResults();
+                loadJobHistory();
             } else if (data.status === 'failed') {
                 stopPolling();
+                removeStopButton();
                 showError(data.error || 'Analysis failed');
                 resetForm();
+                loadJobHistory();
+            } else if (data.status === 'cancelled') {
+                stopPolling();
+                removeStopButton();
+                showError('Analysis was cancelled');
+                resetForm();
+                loadJobHistory();
             }
 
         } catch (error) {
             console.error('Error polling status:', error);
             stopPolling();
+            removeStopButton();
             showError(error.message);
             resetForm();
         }
@@ -144,10 +388,20 @@ function stopPolling() {
 }
 
 /**
+ * Remove stop button
+ */
+function removeStopButton() {
+    document.getElementById('topActions').innerHTML = '';
+}
+
+/**
  * Update progress UI
  */
 function updateProgress(data) {
     const { phase, progress_pct, message } = data;
+
+    // Update title
+    document.getElementById('mainTitle').textContent = `Analyzing ${data.app_name || data.app_id}...`;
 
     // Update progress bar
     document.getElementById('progressBar').style.width = `${progress_pct}%`;
@@ -170,23 +424,22 @@ function updateProgress(data) {
     for (let i = 1; i <= 5; i++) {
         const phaseEl = document.getElementById(`phase${i}`);
         const iconEl = phaseEl.querySelector('.phase-icon');
-        const textEl = phaseEl.querySelector('.phase-text');
 
         if (i < currentPhaseNum) {
             // Completed phase
-            iconEl.textContent = '✅';
-            phaseEl.classList.remove('text-gray-500');
-            phaseEl.classList.add('text-green-600', 'font-medium');
+            iconEl.textContent = '✓';
+            phaseEl.classList.remove('text-gray-600');
+            phaseEl.classList.add('text-green-500');
         } else if (i === currentPhaseNum) {
             // Current phase
             iconEl.textContent = '⏳';
-            phaseEl.classList.remove('text-gray-500', 'text-green-600');
-            phaseEl.classList.add('text-blue-600', 'font-semibold');
+            phaseEl.classList.remove('text-gray-600', 'text-green-500');
+            phaseEl.classList.add('text-blue-500');
         } else {
             // Pending phase
             iconEl.textContent = '⏳';
-            phaseEl.classList.remove('text-green-600', 'text-blue-600', 'font-medium', 'font-semibold');
-            phaseEl.classList.add('text-gray-500');
+            phaseEl.classList.remove('text-green-500', 'text-blue-500');
+            phaseEl.classList.add('text-gray-600');
         }
     }
 }
@@ -203,10 +456,12 @@ async function loadResults() {
             throw new Error(data.error || 'Failed to load results');
         }
 
-        // Hide progress, show results
-        hideProgress();
-        showResults();
+        // Show results panel
+        showResultsPanel();
         resetForm();
+
+        // Update title
+        document.getElementById('mainTitle').textContent = `Results: ${data.summary.app_name || currentJobId}`;
 
         // Update summary cards
         document.getElementById('totalReviews').textContent = data.summary.total_reviews.toLocaleString();
@@ -218,6 +473,10 @@ async function loadResults() {
         renderBarChart(data.bar_chart);
         renderTopicsTable(data.topics_table);
 
+        // Clear chat history
+        chatHistory = [];
+        document.getElementById('chatMessages').innerHTML = '';
+
     } catch (error) {
         console.error('Error loading results:', error);
         showError(error.message);
@@ -226,19 +485,17 @@ async function loadResults() {
 }
 
 /**
- * Render line chart (Topic trends over time)
+ * Render line chart
  */
 function renderLineChart(chartData) {
     const ctx = document.getElementById('lineChart').getContext('2d');
 
-    // Destroy existing chart
     if (lineChartInstance) {
         lineChartInstance.destroy();
     }
 
-    // Set Chart.js defaults for dark mode
-    Chart.defaults.color = '#a3a3a3'; // Light gray text
-    Chart.defaults.borderColor = '#1a1a1a'; // Dark borders
+    Chart.defaults.color = '#6b7280';
+    Chart.defaults.borderColor = '#1a1a1a';
 
     lineChartInstance = new Chart(ctx, {
         type: 'line',
@@ -250,79 +507,43 @@ function renderLineChart(chartData) {
                 legend: {
                     position: 'bottom',
                     labels: {
-                        boxWidth: 12,
-                        padding: 10,
-                        font: {
-                            size: 11
-                        },
-                        color: '#a3a3a3'
+                        boxWidth: 10,
+                        padding: 8,
+                        font: { size: 10 },
+                        color: '#6b7280'
                     }
-                },
-                title: {
-                    display: true,
-                    text: 'Top 10 Topics - Daily Mentions',
-                    font: {
-                        size: 14,
-                        weight: 'normal'
-                    },
-                    color: '#ffffff'
                 },
                 tooltip: {
                     mode: 'index',
                     intersect: false,
                     backgroundColor: '#111111',
-                    borderColor: '#1a1a1a',
+                    borderColor: '#2a2a2a',
                     borderWidth: 1,
                     titleColor: '#ffffff',
-                    bodyColor: '#a3a3a3'
+                    bodyColor: '#9ca3af'
                 }
             },
             scales: {
                 y: {
                     beginAtZero: true,
-                    ticks: {
-                        precision: 0,
-                        color: '#a3a3a3'
-                    },
-                    title: {
-                        display: true,
-                        text: 'Number of Mentions',
-                        color: '#a3a3a3'
-                    },
-                    grid: {
-                        color: '#1a1a1a'
-                    }
+                    ticks: { precision: 0, color: '#6b7280' },
+                    grid: { color: '#1a1a1a' }
                 },
                 x: {
-                    ticks: {
-                        color: '#a3a3a3'
-                    },
-                    title: {
-                        display: true,
-                        text: 'Date',
-                        color: '#a3a3a3'
-                    },
-                    grid: {
-                        color: '#1a1a1a'
-                    }
+                    ticks: { color: '#6b7280' },
+                    grid: { color: '#1a1a1a' }
                 }
-            },
-            interaction: {
-                mode: 'nearest',
-                axis: 'x',
-                intersect: false
             }
         }
     });
 }
 
 /**
- * Render bar chart (Top topics by frequency)
+ * Render bar chart
  */
 function renderBarChart(chartData) {
     const ctx = document.getElementById('barChart').getContext('2d');
 
-    // Destroy existing chart
     if (barChartInstance) {
         barChartInstance.destroy();
     }
@@ -331,28 +552,17 @@ function renderBarChart(chartData) {
         type: 'bar',
         data: chartData,
         options: {
-            indexAxis: 'y',  // Horizontal bar chart
+            indexAxis: 'y',
             responsive: true,
             maintainAspectRatio: false,
             plugins: {
-                legend: {
-                    display: false
-                },
-                title: {
-                    display: true,
-                    text: 'Top 15 Topics - Total Mentions',
-                    font: {
-                        size: 14,
-                        weight: 'normal'
-                    },
-                    color: '#ffffff'
-                },
+                legend: { display: false },
                 tooltip: {
                     backgroundColor: '#111111',
-                    borderColor: '#1a1a1a',
+                    borderColor: '#2a2a2a',
                     borderWidth: 1,
                     titleColor: '#ffffff',
-                    bodyColor: '#a3a3a3',
+                    bodyColor: '#9ca3af',
                     callbacks: {
                         label: function(context) {
                             return `Mentions: ${context.parsed.x}`;
@@ -363,26 +573,12 @@ function renderBarChart(chartData) {
             scales: {
                 x: {
                     beginAtZero: true,
-                    ticks: {
-                        precision: 0,
-                        color: '#a3a3a3'
-                    },
-                    title: {
-                        display: true,
-                        text: 'Total Mentions',
-                        color: '#a3a3a3'
-                    },
-                    grid: {
-                        color: '#1a1a1a'
-                    }
+                    ticks: { precision: 0, color: '#6b7280' },
+                    grid: { color: '#1a1a1a' }
                 },
                 y: {
-                    ticks: {
-                        color: '#a3a3a3'
-                    },
-                    grid: {
-                        color: '#1a1a1a'
-                    }
+                    ticks: { color: '#6b7280' },
+                    grid: { color: '#1a1a1a' }
                 }
             }
         }
@@ -398,12 +594,11 @@ function renderTopicsTable(topics) {
 
     topics.forEach((topic, index) => {
         const row = document.createElement('tr');
-        row.className = index % 2 === 0 ? 'bg-[#0a0a0a]' : 'bg-[#111111]';
         row.innerHTML = `
             <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">${index + 1}</td>
             <td class="px-6 py-4 text-sm font-medium text-white">${escapeHtml(topic.topic)}</td>
             <td class="px-6 py-4 whitespace-nowrap text-sm text-white">
-                <span class="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-blue-600/30 text-blue-400 border border-blue-500/30">
+                <span class="inline-flex items-center px-3 py-1 rounded-full text-xs font-medium bg-blue-600/30 text-blue-400 border border-blue-500/30">
                     ${topic.total_count.toLocaleString()}
                 </span>
             </td>
@@ -412,12 +607,11 @@ function renderTopicsTable(topics) {
         tbody.appendChild(row);
     });
 
-    // Store original data for filtering
     tbody.dataset.originalData = JSON.stringify(topics);
 }
 
 /**
- * Handle table search/filter
+ * Handle table search
  */
 function handleTableSearch(e) {
     const searchTerm = e.target.value.toLowerCase();
@@ -437,6 +631,78 @@ function handleTableSearch(e) {
 }
 
 /**
+ * Chat functions
+ */
+async function sendChatMessage() {
+    const input = document.getElementById('chatInput');
+    const question = input.value.trim();
+
+    if (!question || !currentJobId) return;
+
+    // Add user message to chat
+    addChatMessage(question, 'user');
+    input.value = '';
+
+    // Show loading indicator
+    const loadingId = addChatMessage('Thinking...', 'assistant', true);
+
+    try {
+        const response = await fetch(`/api/chat/${currentJobId}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ question })
+        });
+
+        const data = await response.json();
+
+        // Remove loading, add real response
+        removeChatMessage(loadingId);
+        addChatMessage(data.answer, 'assistant');
+
+    } catch (error) {
+        removeChatMessage(loadingId);
+        addChatMessage('Sorry, I encountered an error: ' + error.message, 'assistant');
+    }
+}
+
+function addChatMessage(text, sender, isLoading = false) {
+    const messagesDiv = document.getElementById('chatMessages');
+    const messageId = `msg-${Date.now()}`;
+
+    const messageDiv = document.createElement('div');
+    messageDiv.id = messageId;
+    messageDiv.className = `flex ${sender === 'user' ? 'justify-end' : 'justify-start'} chat-message`;
+
+    messageDiv.innerHTML = `
+        <div class="max-w-[80%] px-4 py-2 rounded-lg ${
+            sender === 'user'
+                ? 'bg-white text-black'
+                : 'bg-[#1a1a1a] text-gray-100'
+        }">
+            ${isLoading ? '<span class="animate-pulse">●●●</span>' : escapeHtml(text)}
+        </div>
+    `;
+
+    messagesDiv.appendChild(messageDiv);
+    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+
+    chatHistory.push({ id: messageId, text, sender });
+
+    return messageId;
+}
+
+function removeChatMessage(messageId) {
+    const msg = document.getElementById(messageId);
+    if (msg) msg.remove();
+    chatHistory = chatHistory.filter(m => m.id !== messageId);
+}
+
+function askQuickQuestion(question) {
+    document.getElementById('chatInput').value = question;
+    sendChatMessage();
+}
+
+/**
  * Handle Excel download
  */
 async function handleDownload() {
@@ -446,7 +712,6 @@ async function handleDownload() {
     }
 
     try {
-        // Open download in new tab
         window.open(`/api/download/${currentJobId}`, '_blank');
     } catch (error) {
         console.error('Error downloading file:', error);
@@ -455,48 +720,65 @@ async function handleDownload() {
 }
 
 /**
- * Show/Hide UI sections
+ * Show/Hide panels
  */
-function showProgress() {
-    progressSection.classList.remove('hidden');
+function showConfigPanel() {
+    configPanel.classList.remove('hidden');
+    progressPanel.classList.add('hidden');
+    resultsPanel.classList.add('hidden');
+    errorPanel.classList.add('hidden');
+    document.getElementById('mainTitle').textContent = 'Review Trend Analysis';
+    removeStopButton();
+    currentJobId = null;
 }
 
-function hideProgress() {
-    progressSection.classList.add('hidden');
+function showProgressPanel() {
+    configPanel.classList.add('hidden');
+    progressPanel.classList.remove('hidden');
+    resultsPanel.classList.add('hidden');
+    errorPanel.classList.add('hidden');
 }
 
-function showResults() {
-    resultsSection.classList.remove('hidden');
-}
-
-function hideResults() {
-    resultsSection.classList.add('hidden');
+function showResultsPanel() {
+    configPanel.classList.add('hidden');
+    progressPanel.classList.add('hidden');
+    resultsPanel.classList.remove('hidden');
+    errorPanel.classList.add('hidden');
 }
 
 function showError(message) {
-    errorSection.classList.remove('hidden');
+    configPanel.classList.add('hidden');
+    progressPanel.classList.add('hidden');
+    resultsPanel.classList.add('hidden');
+    errorPanel.classList.remove('hidden');
     document.getElementById('errorMessage').textContent = message;
-}
-
-function hideError() {
-    errorSection.classList.add('hidden');
+    document.getElementById('mainTitle').textContent = 'Error';
 }
 
 /**
- * Reset form to initial state
+ * Show toast notification
+ */
+function showToast(message, type = 'info') {
+    const toast = document.createElement('div');
+    toast.className = `fixed top-4 right-4 px-6 py-3 rounded-lg text-white shadow-lg z-50 ${
+        type === 'warning' ? 'bg-yellow-600' :
+        type === 'error' ? 'bg-red-600' : 'bg-blue-600'
+    }`;
+    toast.textContent = message;
+    document.body.appendChild(toast);
+
+    setTimeout(() => toast.remove(), 3000);
+}
+
+/**
+ * Reset form
  */
 function resetForm() {
     startButton.disabled = false;
-    startButton.innerHTML = `
-        <svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path>
-        </svg>
-        Start Analysis
-    `;
 }
 
 /**
- * Escape HTML to prevent XSS
+ * Utility functions
  */
 function escapeHtml(text) {
     const div = document.createElement('div');
@@ -504,84 +786,21 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
-/**
- * Format date for display
- */
 function formatDate(dateString) {
     const date = new Date(dateString);
+    const now = new Date();
+    const diffMs = now - date;
+    const diffMins = Math.floor(diffMs / 60000);
+    const diffHours = Math.floor(diffMs / 3600000);
+    const diffDays = Math.floor(diffMs / 86400000);
+
+    if (diffMins < 1) return 'Just now';
+    if (diffMins < 60) return `${diffMins}m ago`;
+    if (diffHours < 24) return `${diffHours}h ago`;
+    if (diffDays < 7) return `${diffDays}d ago`;
+
     return date.toLocaleDateString('en-US', {
-        year: 'numeric',
         month: 'short',
         day: 'numeric'
     });
-}
-
-/**
- * Check LLM provider status and display banner
- */
-async function checkLLMStatus() {
-    try {
-        const response = await fetch('/api/health/llm');
-        const data = await response.json();
-
-        const banner = document.getElementById('llmStatusBanner');
-        banner.classList.remove('hidden');
-
-        if (data.status === 'ok') {
-            // Ollama is ready
-            const modelInfo = data.extraction_model && data.consolidation_model
-                ? `${data.extraction_model} (extraction) + ${data.consolidation_model} (consolidation)`
-                : data.models ? data.models.join(', ') : 'Ready';
-
-            banner.innerHTML = `
-                <div class="bg-green-900/30 border border-green-500/50 rounded-lg p-4 flex items-start">
-                    <svg class="w-5 h-5 text-green-500 mr-3 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-                    </svg>
-                    <div class="flex-1">
-                        <p class="text-sm font-medium text-green-400">
-                            ${data.message}
-                        </p>
-                        <p class="text-xs text-green-300 mt-1">
-                            Models: ${modelInfo}
-                            ${data.provider === 'ollama' ? ' • 100% Free & Local' : ''}
-                        </p>
-                    </div>
-                </div>
-            `;
-        } else if (data.status === 'warning') {
-            // Missing models
-            banner.innerHTML = `
-                <div class="bg-yellow-900/30 border border-yellow-500/50 rounded-lg p-4 flex items-start">
-                    <svg class="w-5 h-5 text-yellow-500 mr-3 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path>
-                    </svg>
-                    <div class="flex-1">
-                        <p class="text-sm font-medium text-yellow-400">
-                            ${data.message}
-                        </p>
-                        ${data.instructions ? `<p class="text-xs text-yellow-300 mt-1 font-mono">${escapeHtml(data.instructions)}</p>` : ''}
-                    </div>
-                </div>
-            `;
-        } else {
-            // Error
-            banner.innerHTML = `
-                <div class="bg-red-900/30 border border-red-500/50 rounded-lg p-4 flex items-start">
-                    <svg class="w-5 h-5 text-red-500 mr-3 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-                    </svg>
-                    <div class="flex-1">
-                        <p class="text-sm font-medium text-red-400">
-                            ${data.message}
-                        </p>
-                        ${data.instructions ? `<p class="text-xs text-red-300 mt-1">${escapeHtml(data.instructions)}</p>` : ''}
-                    </div>
-                </div>
-            `;
-        }
-    } catch (error) {
-        console.error('Failed to check LLM status:', error);
-        // Silently fail - don't show error banner if health check fails
-    }
 }

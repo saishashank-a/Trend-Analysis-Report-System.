@@ -1,6 +1,8 @@
 # LLM Dependencies
 requests>=2.31.0
 python-dotenv>=1.0.0
+httpx[http2]>=0.25.0
+psutil>=5.9.0
 
 # Optional: Cloud LLM providers (not required with Ollama)
 # anthropic>=0.18.0
