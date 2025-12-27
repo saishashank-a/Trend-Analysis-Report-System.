@@ -12,10 +12,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from flask import Flask, render_template, request, jsonify, send_file
 from flask_cors import CORS
+from google_play_scraper import app as get_app_details
 from main import (
     scrape_reviews, extract_all_topics, consolidate_topics,
     map_topics_to_canonical, generate_trend_report, extract_app_id_from_link,
-    SWIGGY_APP_ID, OUTPUT_DIR
+    OUTPUT_DIR
 )
 from config.cache_db import JobDatabase
 
@@ -28,6 +29,17 @@ job_db = JobDatabase()
 # Cancellation flags for active jobs
 cancel_flags = {}
 cancel_flags_lock = threading.Lock()
+
+
+def get_app_name(app_id: str) -> str:
+    """Fetch actual app name from Google Play Store"""
+    try:
+        app_details = get_app_details(app_id, lang='en', country='us')
+        return app_details.get('title', app_id.split('.')[-2] if '.' in app_id else app_id)
+    except Exception as e:
+        print(f"Warning: Could not fetch app name for {app_id}: {e}")
+        # Fallback: extract from package ID
+        return app_id.split('.')[-2] if '.' in app_id else app_id
 
 
 def is_job_cancelled(job_id: str) -> bool:
@@ -128,7 +140,7 @@ def run_analysis_job(job_id, app_id, target_date, days):
             metrics={'total': unique_count}
         )
 
-        canonical_mapping = consolidate_topics(all_extracted_topics)
+        canonical_mapping = consolidate_topics(all_extracted_topics, app_id=app_id)
 
         update_job_progress(
             job_id,
@@ -141,16 +153,22 @@ def run_analysis_job(job_id, app_id, target_date, days):
         # Phase 4: Trend Analysis
         update_job_progress(job_id, 'Trend Analysis', 80, 'Analyzing trends...')
 
-        canonical_counts, unmapped_topics = map_topics_to_canonical(topics_by_date, canonical_mapping)
+        canonical_counts, unmapped_topics = map_topics_to_canonical(topics_by_date, canonical_mapping, app_id=app_id)
 
         update_job_progress(job_id, 'Trend Analysis', 85, 'Trend analysis complete')
 
         # Phase 5: Report Generation
         update_job_progress(job_id, 'Report Generation', 90, 'Generating Excel report...')
 
-        # Generate output filename
-        app_name = app_id.split('.')[-2] if '.' in app_id else app_id
-        output_file = OUTPUT_DIR / f"{app_name}_trend_report_{target_date.strftime('%Y-%m-%d')}.xlsx"
+        # Get app name from job database (already fetched from Play Store)
+        job = job_db.get_job(job_id)
+        app_name = job.get('app_name', app_id.split('.')[-2] if '.' in app_id else app_id)
+
+        # Sanitize app name for filename (remove special characters)
+        safe_app_name = "".join(c for c in app_name if c.isalnum() or c in (' ', '-', '_')).strip()
+        safe_app_name = safe_app_name.replace(' ', '_')
+
+        output_file = OUTPUT_DIR / f"{safe_app_name}_trend_report_{target_date.strftime('%Y-%m-%d')}.xlsx"
 
         generate_trend_report(canonical_counts, target_date, str(output_file), canonical_mapping, unmapped_topics)
 
@@ -303,31 +321,53 @@ def start_analysis():
     Request body:
     {
         "app_id": "in.swiggy.android" or "Play Store URL",
-        "target_date": "2025-12-24" (optional, defaults to today),
-        "days": 30 (optional, defaults to 30)
+        "start_date": "2025-11-27" (optional, defaults to 30 days ago),
+        "end_date": "2025-12-27" (optional, defaults to today)
     }
     """
     try:
         data = request.get_json()
 
-        # Extract and validate app ID
-        app_id_input = data.get('app_id', SWIGGY_APP_ID)
-        app_id = extract_app_id_from_link(app_id_input) if app_id_input else SWIGGY_APP_ID
+        # Extract and validate app ID (support both 'app_id' and 'app_link' for compatibility)
+        app_id_input = data.get('app_link') or data.get('app_id')
+        if not app_id_input:
+            return jsonify({'error': 'Please provide an app package ID or Play Store link'}), 400
 
-        # Parse target date
-        target_date_str = data.get('target_date')
-        if target_date_str:
-            target_date = datetime.strptime(target_date_str, "%Y-%m-%d")
+        app_id = extract_app_id_from_link(app_id_input)
+
+        # Parse dates (support both new format and legacy format)
+        start_date_str = data.get('start_date')
+        end_date_str = data.get('end_date')
+
+        # Legacy support: convert target_date + days to start_date + end_date
+        if not start_date_str or not end_date_str:
+            target_date_str = data.get('target_date')
+            days = int(data.get('days', 30))
+
+            if target_date_str:
+                end_date = datetime.strptime(target_date_str, "%Y-%m-%d")
+            else:
+                end_date = datetime.now()
+
+            start_date = end_date - timedelta(days=days)
         else:
-            target_date = datetime.now()
+            # New format: direct start and end dates
+            start_date = datetime.strptime(start_date_str, "%Y-%m-%d")
+            end_date = datetime.strptime(end_date_str, "%Y-%m-%d")
 
-        # Get days parameter
-        days = int(data.get('days', 30))
-        if days < 1 or days > 90:
-            return jsonify({'error': 'Days must be between 1 and 90'}), 400
+        # Validate date range
+        if start_date > end_date:
+            return jsonify({'error': 'Start date must be before end date'}), 400
+
+        days = (end_date - start_date).days
+        if days < 1 or days > 365:
+            return jsonify({'error': 'Date range must be between 1 and 365 days'}), 400
 
         # Create job
         job_id = str(uuid.uuid4())
+
+        # Fetch actual app name from Google Play Store
+        app_name = get_app_name(app_id)
 
         # Create job in database
         job_db.create_job({
@@ -336,8 +376,8 @@ def start_analysis():
             'phase': 'Initializing',
             'message': 'Starting analysis...',
             'app_id': app_id,
-            'app_name': data.get('app_name'),  # Optional app name
-            'target_date': target_date.isoformat(),
+            'app_name': app_name,  # Real app name from Play Store
+            'target_date': end_date.isoformat(),
             'days': days
         })
 
@@ -348,7 +388,7 @@ def start_analysis():
         # Start background job
         thread = threading.Thread(
             target=run_analysis_job,
-            args=(job_id, app_id, target_date, days),
+            args=(job_id, app_id, end_date, days),
             daemon=True
         )
         thread.start()
@@ -472,16 +512,21 @@ def cancel_job(job_id):
 
 @app.route('/api/delete/<job_id>', methods=['DELETE'])
 def delete_job(job_id):
-    """Delete a job from history"""
+    """Delete a job from history (will cancel if running)"""
     try:
         job = job_db.get_job(job_id)
         if not job:
             return jsonify({'error': 'Job not found'}), 404
 
-        # Don't allow deleting running jobs
+        # If job is running, cancel it first
         if job['status'] in ['running', 'started']:
-            return jsonify({'error': 'Cannot delete a running job. Cancel it first.'}), 400
+            with cancel_flags_lock:
+                if job_id in cancel_flags:
+                    cancel_flags[job_id].set()
+            # Mark as cancelled in database
+            job_db.cancel_job(job_id)
 
+        # Now delete
         job_db.delete_job(job_id)
         return jsonify({'success': True, 'message': 'Job deleted successfully'})
 
@@ -489,10 +534,65 @@ def delete_job(job_id):
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/api/chat/<job_id>', methods=['POST'])
-def chat_with_results(job_id):
-    """Answer questions about analysis results using LLM"""
+@app.route('/api/retry/<job_id>', methods=['POST'])
+def retry_job(job_id):
+    """Retry a failed or cancelled job"""
     try:
+        old_job = job_db.get_job(job_id)
+        if not old_job:
+            return jsonify({'error': 'Job not found'}), 404
+
+        if old_job['status'] not in ['failed', 'cancelled']:
+            return jsonify({'error': 'Can only retry failed or cancelled jobs'}), 400
+
+        # Create new job with same parameters
+        new_job_id = str(uuid.uuid4())
+
+        job_db.create_job({
+            'job_id': new_job_id,
+            'status': 'started',
+            'phase': 'Initializing',
+            'message': f'Retrying previous job ({job_id[:8]}...)',
+            'app_id': old_job['app_id'],
+            'app_name': old_job.get('app_name'),
+            'target_date': old_job['target_date'],
+            'days': old_job['days']
+        })
+
+        # Register cancellation flag
+        with cancel_flags_lock:
+            cancel_flags[new_job_id] = threading.Event()
+
+        # Parse target date
+        target_date = datetime.fromisoformat(old_job['target_date'])
+
+        # Start background job
+        thread = threading.Thread(
+            target=run_analysis_job,
+            args=(new_job_id, old_job['app_id'], target_date, old_job['days']),
+            daemon=True
+        )
+        thread.start()
+
+        return jsonify({
+            'job_id': new_job_id,
+            'message': 'Retry started successfully'
+        })
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/chat/<job_id>', methods=['GET', 'POST'])
+def chat_with_results(job_id):
+    """Answer questions about analysis results using LLM or retrieve chat history"""
+    try:
+        # GET: Retrieve chat history
+        if request.method == 'GET':
+            chat_history = job_db.get_chat_history(job_id)
+            return jsonify({'messages': chat_history})
+
+        # POST: Send new message and get response
         data = request.json
         user_question = data.get('question', '')
 
@@ -503,6 +603,9 @@ def chat_with_results(job_id):
         job = job_db.get_job(job_id)
         if not job or job['status'] != 'completed':
             return jsonify({'error': 'Job not found or not completed'}), 404
+
+        # Save user message to database
+        job_db.save_chat_message(job_id, 'user', user_question)
 
         # Prepare context from results
         results_summary = "Analysis results:\n"
@@ -530,6 +633,9 @@ User question: {user_question}
 Provide a clear, concise answer based on the data above. If the question cannot be answered with the available data, say so."""
 
         response = llm_client.chat(prompt, max_tokens=500)
+
+        # Save assistant response to database
+        job_db.save_chat_message(job_id, 'assistant', response)
 
         return jsonify({
             'question': user_question,

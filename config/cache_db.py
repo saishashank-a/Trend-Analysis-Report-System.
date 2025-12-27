@@ -1,11 +1,12 @@
 """
 SQLite Database Layer for Caching and Job Persistence
-Provides LLM response caching and persistent job tracking
+Provides LLM response caching, embedding caching, and persistent job tracking
 """
 
 import sqlite3
 import json
 import hashlib
+import numpy as np
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 from datetime import datetime
@@ -121,7 +122,7 @@ class JobDatabase:
         self._init_db()
 
     def _init_db(self):
-        """Initialize jobs table"""
+        """Initialize jobs and chat_messages tables"""
         conn = sqlite3.connect(self.db_file)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS jobs (
@@ -147,6 +148,21 @@ class JobDatabase:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_app ON jobs(app_id)")
+
+        # Chat messages table for persistent chat history
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_job ON chat_messages(job_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_created ON chat_messages(created_at)")
+
         conn.commit()
         conn.close()
 
@@ -280,3 +296,178 @@ class JobDatabase:
             'by_status': by_status,
             'completed_jobs': completed_jobs
         }
+
+    def save_chat_message(self, job_id: str, role: str, content: str):
+        """Save a chat message to database"""
+        conn = sqlite3.connect(self.db_file)
+        conn.execute("""
+            INSERT INTO chat_messages (job_id, role, content)
+            VALUES (?, ?, ?)
+        """, (job_id, role, content))
+        conn.commit()
+        conn.close()
+
+    def get_chat_history(self, job_id: str) -> List[dict]:
+        """Get all chat messages for a job"""
+        conn = sqlite3.connect(self.db_file)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT role, content, created_at
+            FROM chat_messages
+            WHERE job_id = ?
+            ORDER BY created_at ASC
+        """, (job_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+
+    def clear_chat_history(self, job_id: str):
+        """Clear all chat messages for a job"""
+        conn = sqlite3.connect(self.db_file)
+        conn.execute("DELETE FROM chat_messages WHERE job_id = ?", (job_id,))
+        conn.commit()
+        conn.close()
+
+
+class EmbeddingCache:
+    """SQLite-based cache for semantic embeddings"""
+
+    def __init__(self, cache_file: Path = None):
+        if cache_file is None:
+            cache_file = Path("cache/embedding_cache.db")
+        self.cache_file = cache_file
+        self.cache_file.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+
+    def _init_db(self):
+        """Initialize database schema for embeddings"""
+        conn = sqlite3.connect(self.cache_file)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS embeddings (
+                text_hash TEXT PRIMARY KEY,
+                text TEXT NOT NULL,
+                model TEXT NOT NULL,
+                embedding BLOB NOT NULL,
+                embedding_dim INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                hit_count INTEGER DEFAULT 0
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_embedding_model ON embeddings(model)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_embedding_created ON embeddings(created_at)")
+        conn.commit()
+        conn.close()
+
+    def get_embedding(self, text_hash: str, app_id: str = None) -> Optional[np.ndarray]:
+        """
+        Retrieve cached embedding
+
+        Args:
+            text_hash: SHA256 hash of the text
+            app_id: App package ID for app-specific caching (optional for backwards compatibility)
+
+        Returns:
+            numpy array of embedding or None if not cached
+        """
+        conn = sqlite3.connect(self.cache_file)
+        cursor = conn.cursor()
+
+        # If app_id provided, include it in the lookup for app-specific caching
+        if app_id:
+            cache_key = f"{app_id}:{text_hash}"
+            cursor.execute(
+                "SELECT embedding, embedding_dim FROM embeddings WHERE text_hash = ?",
+                (cache_key,)
+            )
+        else:
+            # Fallback to old behavior for backwards compatibility
+            cursor.execute(
+                "SELECT embedding, embedding_dim FROM embeddings WHERE text_hash = ?",
+                (text_hash,)
+            )
+
+        result = cursor.fetchone()
+
+        if result:
+            # Increment hit count
+            if app_id:
+                cache_key = f"{app_id}:{text_hash}"
+                cursor.execute(
+                    "UPDATE embeddings SET hit_count = hit_count + 1 WHERE text_hash = ?",
+                    (cache_key,)
+                )
+            else:
+                cursor.execute(
+                    "UPDATE embeddings SET hit_count = hit_count + 1 WHERE text_hash = ?",
+                    (text_hash,)
+                )
+            conn.commit()
+
+            # Deserialize numpy array
+            embedding_bytes, dim = result
+            embedding = np.frombuffer(embedding_bytes, dtype=np.float32).reshape(dim)
+            conn.close()
+            return embedding
+
+        conn.close()
+        return None
+
+    def set_embedding(self, text_hash: str, text: str, model: str, embedding: np.ndarray, app_id: str = None):
+        """
+        Store embedding in cache
+
+        Args:
+            text_hash: SHA256 hash of the text
+            text: Original text (for debugging)
+            model: Model name used to generate embedding
+            embedding: numpy array of the embedding
+            app_id: App package ID for app-specific caching (optional for backwards compatibility)
+        """
+        conn = sqlite3.connect(self.cache_file)
+
+        # Serialize numpy array to bytes
+        embedding_bytes = embedding.astype(np.float32).tobytes()
+        dim = embedding.shape[0]
+
+        # If app_id provided, include it in cache key for app-specific caching
+        if app_id:
+            cache_key = f"{app_id}:{text_hash}"
+        else:
+            cache_key = text_hash
+
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO embeddings
+            (text_hash, text, model, embedding, embedding_dim)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (cache_key, text, model, embedding_bytes, dim)
+        )
+        conn.commit()
+        conn.close()
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get cache statistics"""
+        conn = sqlite3.connect(self.cache_file)
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT COUNT(*), SUM(hit_count) FROM embeddings")
+        total_entries, total_hits = cursor.fetchone()
+
+        cursor.execute("SELECT model, COUNT(*) FROM embeddings GROUP BY model")
+        by_model = dict(cursor.fetchall())
+
+        conn.close()
+        return {
+            'total_entries': total_entries or 0,
+            'total_hits': total_hits or 0,
+            'by_model': by_model
+        }
+
+    def clear(self):
+        """Clear all cached embeddings"""
+        conn = sqlite3.connect(self.cache_file)
+        conn.execute("DELETE FROM embeddings")
+        conn.commit()
+        conn.close()

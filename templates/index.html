@@ -169,34 +169,48 @@
                                 />
                             </div>
 
-                            <!-- Date Range -->
-                            <div class="grid grid-cols-2 gap-4">
+                            <!-- Quick Date Range Selector -->
+                            <div>
+                                <label for="days" class="block text-sm font-medium text-gray-300 mb-2">
+                                    Quick Select Period
+                                </label>
+                                <select
+                                    id="days"
+                                    name="days"
+                                    class="w-full px-4 py-3 bg-[#0a0a0a] border border-[#2a2a2a] rounded-lg focus:outline-none focus:border-[#3a3a3a] transition-all"
+                                >
+                                    <option value="7">Last 7 days</option>
+                                    <option value="14">Last 14 days</option>
+                                    <option value="30" selected>Last 30 days</option>
+                                    <option value="60">Last 60 days</option>
+                                    <option value="90">Last 90 days</option>
+                                    <option value="custom">Custom Range</option>
+                                </select>
+                            </div>
+
+                            <!-- Custom Date Range (hidden by default) -->
+                            <div id="customDateRange" class="grid grid-cols-2 gap-4" style="display: none;">
                                 <div>
-                                    <label for="targetDate" class="block text-sm font-medium text-gray-300 mb-2">
-                                        Target Date
+                                    <label for="startDate" class="block text-sm font-medium text-gray-300 mb-2">
+                                        Start Date
                                     </label>
                                     <input
                                         type="date"
-                                        id="targetDate"
-                                        name="targetDate"
+                                        id="startDate"
+                                        name="startDate"
                                         class="w-full px-4 py-3 bg-[#0a0a0a] border border-[#2a2a2a] rounded-lg focus:outline-none focus:border-[#3a3a3a] transition-all"
                                     />
                                 </div>
                                 <div>
-                                    <label for="days" class="block text-sm font-medium text-gray-300 mb-2">
-                                        Analysis Period
+                                    <label for="endDate" class="block text-sm font-medium text-gray-300 mb-2">
+                                        End Date
                                     </label>
-                                    <select
-                                        id="days"
-                                        name="days"
+                                    <input
+                                        type="date"
+                                        id="endDate"
+                                        name="endDate"
                                         class="w-full px-4 py-3 bg-[#0a0a0a] border border-[#2a2a2a] rounded-lg focus:outline-none focus:border-[#3a3a3a] transition-all"
-                                    >
-                                        <option value="7">7 days</option>
-                                        <option value="14">14 days</option>
-                                        <option value="30" selected>30 days</option>
-                                        <option value="60">60 days</option>
-                                        <option value="90">90 days</option>
-                                    </select>
+                                    />
                                 </div>
                             </div>
 

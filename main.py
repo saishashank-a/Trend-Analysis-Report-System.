@@ -35,6 +35,10 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
+# Import and apply hardware profile optimization
+from config.hardware_profiles import apply_profile
+hardware_profile = apply_profile()  # Auto-detect and configure
+
 # Import LLM abstraction
 from config.llm_client import get_llm_client, OllamaClient, AsyncOllamaClient
 
@@ -286,29 +290,52 @@ def scrape_reviews(app_id: str, start_date: datetime, end_date: datetime) -> Dic
 
                 try:
                     # Fetch reviews with pagination
-                    if batch_num == 1:
-                        # First batch without token
-                        result, continuation_token = reviews(
-                            app_id,
-                            sort=Sort.NEWEST,
-                            count=500,
-                            lang='en',
-                            country='in'
-                        )
-                    else:
-                        # Subsequent batches with continuation token
-                        if not continuation_token:
-                            print("(No more reviews)")
-                            break
+                    # Try US first (more reviews), then IN if that fails
+                    countries_to_try = ['us', 'in']
+                    result = None
+                    last_error = None
 
-                        result, continuation_token = reviews(
-                            app_id,
-                            sort=Sort.NEWEST,
-                            count=500,
-                            lang='en',
-                            country='in',
-                            continuation_token=continuation_token
-                        )
+                    for country in countries_to_try:
+                        try:
+                            if batch_num == 1:
+                                # First batch without token
+                                result, continuation_token = reviews(
+                                    app_id,
+                                    sort=Sort.NEWEST,
+                                    count=500,
+                                    lang='en',
+                                    country=country
+                                )
+                            else:
+                                # Subsequent batches with continuation token
+                                if not continuation_token:
+                                    print("(No more reviews)")
+                                    break
+
+                                result, continuation_token = reviews(
+                                    app_id,
+                                    sort=Sort.NEWEST,
+                                    count=500,
+                                    lang='en',
+                                    country=country,
+                                    continuation_token=continuation_token
+                                )
+
+                            # Success - break out of country loop
+                            if result or batch_num > 1:
+                                break
+
+                        except Exception as country_error:
+                            last_error = country_error
+                            if batch_num == 1 and country == countries_to_try[0]:
+                                # Try next country
+                                continue
+                            else:
+                                raise country_error
+
+                    # If still no result after trying all countries
+                    if not result and batch_num == 1:
+                        raise Exception(f"App not available in any region: {last_error}")
 
                     if not result:
                         print("(Empty batch - stopping)")
@@ -336,8 +363,11 @@ def scrape_reviews(app_id: str, start_date: datetime, end_date: datetime) -> Dic
 
             print(f"\n✓ Total reviews fetched: {len(all_reviews)}")
 
-            # Save to cache
-            save_cached_reviews(app_id, all_reviews)
+            # Save to cache (only if we actually got reviews)
+            if all_reviews:
+                save_cached_reviews(app_id, all_reviews)
+            else:
+                print("  Warning: No reviews fetched, not updating cache")
 
         except Exception as e:
             print(f"Warning: Scraping error: {e}")
@@ -359,11 +389,60 @@ def scrape_reviews(app_id: str, start_date: datetime, end_date: datetime) -> Dic
     reviews_in_range = sum(len(v) for v in reviews_by_date.values())
     print(f"✓ Found {reviews_in_range} reviews within date range")
 
-    # If no reviews in the specified date range, fall back to mock data
+    # Duplicate detection (optional, controlled by env var)
+    enable_dedup = os.getenv('ENABLE_DEDUP', 'false').lower() == 'true'
+    if enable_dedup and reviews_in_range > 0:
+        try:
+            print("\nDuplicate Detection:")
+            from utils.duplicate_detector import DuplicateDetector
+            from config.embedding_service import EmbeddingService
+            from config.cache_db import EmbeddingCache
+
+            # Initialize services with app-specific caching
+            embedding_cache = EmbeddingCache()
+            embedder = EmbeddingService(use_metal=True, cache=embedding_cache, app_id=app_id)
+            threshold = float(os.getenv('DUPLICATE_THRESHOLD', '0.85'))
+            detector = DuplicateDetector(embedder, threshold=threshold)
+
+            # Flatten reviews for deduplication
+            all_reviews_flat = []
+            for date_str, date_reviews in reviews_by_date.items():
+                all_reviews_flat.extend(date_reviews)
+
+            # Detect duplicates
+            unique, duplicates = detector.detect_duplicates(all_reviews_flat)
+
+            # Rebuild reviews_by_date with only unique reviews
+            reviews_by_date_deduped = {}
+            unique_ids = {r['reviewId'] for r in unique}
+
+            for date_str, date_reviews in reviews_by_date.items():
+                reviews_by_date_deduped[date_str] = [
+                    r for r in date_reviews if r['reviewId'] in unique_ids
+                ]
+
+            reviews_by_date = reviews_by_date_deduped
+            reviews_in_range = sum(len(v) for v in reviews_by_date.values())
+
+            print(f"✓ After deduplication: {reviews_in_range} unique reviews\n")
+
+        except Exception as e:
+            print(f"  Warning: Duplicate detection failed ({e}), continuing without dedup...")
+
+    # If no reviews in the specified date range, raise an error
     if reviews_in_range == 0:
-        print(f"\nNo reviews found for {start_date.date()} to {end_date.date()}")
-        print("Using mock data for demonstration...")
-        return generate_mock_reviews(start_date, end_date)
+        raise ValueError(
+            f"No reviews found for {app_id} between {start_date.date()} and {end_date.date()}. "
+            "This could mean:\n"
+            "  1. The app has very few reviews\n"
+            "  2. No reviews exist for this date range\n"
+            "  3. The app ID is incorrect\n"
+            "  4. Google Play Store rate limiting\n\n"
+            "Please try:\n"
+            "  - A longer date range (e.g., 90 days)\n"
+            "  - A more popular app with more reviews\n"
+            "  - Verifying the app ID is correct"
+        )
 
     return reviews_by_date
 
@@ -646,7 +725,7 @@ def extract_all_topics(reviews_by_date: Dict[str, List[dict]], progress_callback
     """
     print("Extracting topics from reviews (using ASYNC parallel batch processing with REQUEST PIPELINING)...")
     topics_by_date = {}
-    total_reviews = sum(len(reviews) for reviews in reviews_by_date.values())
+    total_reviews = sum(len(date_reviews) for date_reviews in reviews_by_date.values())
 
     # AUTO-DETECT optimal settings
     hw_config = get_optimal_concurrency()
@@ -750,7 +829,7 @@ def extract_all_topics_sync(reviews_by_date: Dict[str, List[dict]], progress_cal
     """Synchronous fallback version of topic extraction"""
     print("Extracting topics from reviews (using synchronous parallel batch processing)...")
     topics_by_date = {}
-    total_reviews = sum(len(reviews) for reviews in reviews_by_date.values())
+    total_reviews = sum(len(date_reviews) for date_reviews in reviews_by_date.values())
 
     BATCH_SIZE = 20
     MAX_WORKERS = 8
@@ -832,17 +911,59 @@ def normalize_topic(topic: str) -> str:
     return normalized
 
 
-def consolidate_topics(all_topics: List[str]) -> Dict[str, List[str]]:
+def consolidate_topics(all_topics: List[str], app_id: str = None) -> Dict[str, List[str]]:
     """
-    Consolidate similar topics using Claude Sonnet with aggressive grouping.
+    Consolidate similar topics using HYBRID approach:
+    1. Try embedding-based clustering (fast, 240x speedup) - default
+    2. Fallback to LLM consolidation if embeddings disabled
+
     Returns mapping of canonical_topic -> list of variations.
+    """
+    if not all_topics:
+        return {}
+
+    # Check if embedding clustering is enabled
+    use_embeddings = os.getenv('ENABLE_EMBEDDING_CLUSTERING', 'true').lower() == 'true'
+
+    if use_embeddings:
+        try:
+            print(f"Consolidating {len(all_topics)} topics using embedding clustering (fast)...")
+
+            # Initialize services
+            from config.embedding_service import EmbeddingService
+            from config.cache_db import EmbeddingCache
+            from ml.topic_clustering import TopicClusterer
+
+            embedding_cache = EmbeddingCache()
+            embedder = EmbeddingService(use_metal=True, cache=embedding_cache, app_id=app_id)
+            clusterer = TopicClusterer(embedder, min_cluster_size=3)
+
+            # Cluster topics
+            canonical_mapping = clusterer.cluster_topics(all_topics)
+
+            print(f"✓ Consolidated to {len(canonical_mapping)} canonical topics using embeddings")
+
+            return canonical_mapping
+
+        except Exception as e:
+            print(f"  Warning: Embedding clustering failed ({e}), falling back to LLM...")
+            # Fall through to LLM-based consolidation
+
+    # Fallback: LLM-based consolidation (original implementation)
+    return consolidate_topics_llm(all_topics)
+
+
+def consolidate_topics_llm(all_topics: List[str]) -> Dict[str, List[str]]:
+    """
+    Original LLM-based consolidation (kept as fallback)
+    Consolidate similar topics using LLM with aggressive grouping.
     """
     if not all_topics:
         return {}
 
     # Remove duplicates but keep count
     unique_topics = list(set(all_topics))
-    print(f"Consolidating {len(unique_topics)} unique topics...")
+    print(f"Consolidating {len(unique_topics)} unique topics using LLM (slow)...")
 
     # Pre-process: Group exact matches after normalization
     normalized_groups = {}
@@ -968,10 +1089,103 @@ def consolidate_topics_heuristic(unique_topics: List[str]) -> Dict[str, List[str
 
 
 def map_topics_to_canonical(topics_by_date: Dict[str, List[str]],
-                           canonical_mapping: Dict[str, List[str]]) -> tuple[Dict[str, Dict[str, int]], Dict[str, str]]:
+                           canonical_mapping: Dict[str, List[str]],
+                           app_id: str = None) -> tuple[Dict[str, Dict[str, int]], Dict[str, str]]:
     """
-    Map extracted topics to canonical topics and count frequencies by date.
+    Map extracted topics to canonical topics using HYBRID approach:
+    1. Try embedding similarity (accurate, fixes duplicate positive feedback issue)
+    2. Fallback to fuzzy matching if embeddings disabled
+
     Returns: (date -> canonical_topic -> count mapping, unmapped_topics -> suggested_canonical mapping)
+    """
+    use_embeddings = os.getenv('ENABLE_EMBEDDING_CLUSTERING', 'true').lower() == 'true'
+
+    if use_embeddings:
+        try:
+            from config.embedding_service import EmbeddingService
+            from config.cache_db import EmbeddingCache
+
+            embedding_cache = EmbeddingCache()
+            embedder = EmbeddingService(use_metal=True, cache=embedding_cache, app_id=app_id)
+
+            return map_topics_to_canonical_embedding(
+                topics_by_date,
+                canonical_mapping,
+                embedder,
+                similarity_threshold=float(os.getenv('TOPIC_SIMILARITY_THRESHOLD', '0.70'))
+            )
+        except Exception as e:
+            print(f"  Warning: Embedding-based mapping failed ({e}), using fuzzy matching...")
+            # Fall through to original implementation
+
+    # Fallback: Original fuzzy matching
+    return map_topics_to_canonical_fuzzy(topics_by_date, canonical_mapping)
+
+
+def map_topics_to_canonical_embedding(
+    topics_by_date: Dict[str, List[str]],
+    canonical_mapping: Dict[str, List[str]],
+    embedding_service,
+    similarity_threshold: float = 0.70
+) -> tuple[Dict[str, Dict[str, int]], Dict[str, str]]:
+    """
+    NEW: Embedding-based topic mapping (much better than substring matching)
+    Fixes the duplicate "positive feedback" issue
+    """
+    # Build list of canonical topics
+    canonical_topics = list(canonical_mapping.keys())
+
+    # Generate embeddings for canonical topics (cached)
+    print(f"  Generating embeddings for {len(canonical_topics)} canonical topics...")
+    canonical_embeddings = embedding_service.encode(canonical_topics, batch_size=128)
+
+    # Track unmapped topics
+    unmapped_topics = {}
+
+    # Count topics by date
+    result = {}
+
+    for date_str in sorted(topics_by_date.keys()):
+        result[date_str] = {}
+        date_topics = topics_by_date[date_str]
+
+        if not date_topics:
+            continue
+
+        # Generate embeddings for this date's topics
+        topic_embeddings = embedding_service.encode(date_topics, batch_size=128)
+
+        # Compute similarity matrix (topics × canonicals)
+        from sklearn.metrics.pairwise import cosine_similarity
+        similarity_matrix = cosine_similarity(topic_embeddings, canonical_embeddings)
+
+        # Map each topic to best canonical match
+        for topic_idx, topic in enumerate(date_topics):
+            similarities = similarity_matrix[topic_idx]
+            best_idx = similarities.argmax()
+            best_similarity = similarities[best_idx]
+
+            if best_similarity >= similarity_threshold:
+                canonical = canonical_topics[best_idx]
+            else:
+                # No good match - use original topic
+                canonical = topic
+                if topic not in unmapped_topics:
+                    # Suggest best match even if below threshold
+                    unmapped_topics[topic] = canonical_topics[best_idx]
+
+            result[date_str][canonical] = result[date_str].get(canonical, 0) + 1
+
+    if unmapped_topics:
+        print(f"  ⚠ {len(unmapped_topics)} topics below similarity threshold ({similarity_threshold})")
+
+    return result, unmapped_topics
+
+
+def map_topics_to_canonical_fuzzy(topics_by_date: Dict[str, List[str]],
+                                   canonical_mapping: Dict[str, List[str]]) -> tuple[Dict[str, Dict[str, int]], Dict[str, str]]:
+    """
+    FALLBACK: Original fuzzy matching (kept for backward compatibility)
     """
     # Build reverse mapping: variation -> canonical (case-insensitive)
     variation_to_canonical = {}
@@ -981,14 +1195,14 @@ def map_topics_to_canonical(topics_by_date: Dict[str, List[str]],
 
     # Track unmapped topics
     unmapped_topics = {}
-    
+
     # Count topics by date
     result = {}
     for date_str in sorted(topics_by_date.keys()):
         result[date_str] = {}
         for topic in topics_by_date[date_str]:
             topic_lower = topic.lower()
-            
+
             # Try exact match first
             if topic_lower in variation_to_canonical:
                 canonical = variation_to_canonical[topic_lower]
@@ -999,7 +1213,7 @@ def map_topics_to_canonical(topics_by_date: Dict[str, List[str]],
                     if var in topic_lower or topic_lower in var:
                         canonical = can
                         break
-                
+
                 # If still not found, use original topic but track it
                 if canonical is None:
                     canonical = topic
@@ -1007,7 +1221,7 @@ def map_topics_to_canonical(topics_by_date: Dict[str, List[str]],
                         # Try to find best canonical match based on keywords
                         best_match = find_best_canonical_match(topic, canonical_mapping)
                         unmapped_topics[topic] = best_match
-            
+
             result[date_str][canonical] = result[date_str].get(canonical, 0) + 1
 
     return result, unmapped_topics
@@ -1273,7 +1487,7 @@ def main():
     for topics in topics_by_date.values():
         all_extracted_topics.extend(topics)
 
-    canonical_mapping = consolidate_topics(all_extracted_topics)
+    canonical_mapping = consolidate_topics(all_extracted_topics, app_id=app_id)
     
     # Debug: Print canonical topics
     print(f"\n📋 Canonical Topics ({len(canonical_mapping)}):")
@@ -1285,7 +1499,7 @@ def main():
     # Phase 4: Generate Trend Matrix
     print("PHASE 4: Trend Analysis")
     print("-" * 40)
-    canonical_counts, unmapped_topics = map_topics_to_canonical(topics_by_date, canonical_mapping)
+    canonical_counts, unmapped_topics = map_topics_to_canonical(topics_by_date, canonical_mapping, app_id=app_id)
     
     # Debug: Print unmapped topics if any
     if unmapped_topics:

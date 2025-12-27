@@ -10,6 +10,7 @@ let lineChartInstance = null;
 let barChartInstance = null;
 let chatHistory = [];
 let sidebarVisible = true;
+let isSendingMessage = false;
 
 // DOM Elements
 const form = document.getElementById('analysisForm');
@@ -22,9 +23,19 @@ const historySidebar = document.getElementById('historySidebar');
 
 // Initialize
 document.addEventListener('DOMContentLoaded', () => {
-    // Set today's date as default
-    const today = new Date().toISOString().split('T')[0];
-    document.getElementById('targetDate').value = today;
+    // Set default date range (end date = today, start date = 30 days ago)
+    const today = new Date();
+    const endDate = today.toISOString().split('T')[0];
+
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    const startDate = thirtyDaysAgo.toISOString().split('T')[0];
+
+    document.getElementById('endDate').value = endDate;
+    document.getElementById('startDate').value = startDate;
+
+    // Handle days dropdown change
+    document.getElementById('days').addEventListener('change', handleDaysChange);
 
     // Load job history
     loadJobHistory();
@@ -42,6 +53,32 @@ document.addEventListener('DOMContentLoaded', () => {
     // History search
     document.getElementById('historySearch').addEventListener('input', handleHistorySearch);
 });
+
+/**
+ * Handle days dropdown change
+ */
+function handleDaysChange(e) {
+    const days = e.target.value;
+    const customDateRange = document.getElementById('customDateRange');
+
+    if (days === 'custom') {
+        // Show custom date range inputs
+        customDateRange.style.display = 'grid';
+    } else {
+        // Hide custom date range and update dates based on selection
+        customDateRange.style.display = 'none';
+
+        const today = new Date();
+        const endDate = today.toISOString().split('T')[0];
+
+        const pastDate = new Date();
+        pastDate.setDate(pastDate.getDate() - parseInt(days));
+        const startDate = pastDate.toISOString().split('T')[0];
+
+        document.getElementById('endDate').value = endDate;
+        document.getElementById('startDate').value = startDate;
+    }
+}
 
 /**
  * Load and display job history
@@ -83,9 +120,10 @@ function renderHistoryList(jobs) {
     const statusIcons = {
         'completed': '✓',
         'failed': '✕',
-        'running': '⏳',
-        'cancelled': '□',
-        'started': '⏳'
+        'running': '⚙️',      // Gear icon for active processing
+        'started': '▶️',      // Play icon for just started
+        'cancelled': '⏹️',     // Stop square
+        'pending': '⏳'       // Hourglass for queued (if ever implemented)
     };
 
     historyList.innerHTML = jobs.map(job => `
@@ -110,17 +148,37 @@ function renderHistoryList(jobs) {
                     }">
                         ${statusIcons[job.status]}
                     </div>
-                    ${job.status !== 'running' && job.status !== 'started' ? `
+                    ${job.status === 'failed' || job.status === 'cancelled' ? `
                         <button
-                            onclick="event.stopPropagation(); deleteJobById('${job.job_id}')"
-                            class="opacity-0 group-hover:opacity-100 transition-opacity p-1 hover:bg-red-600/20 rounded"
-                            title="Delete"
+                            onclick="event.stopPropagation(); retryJobById('${job.job_id}')"
+                            class="opacity-0 group-hover:opacity-100 transition-opacity p-1 hover:bg-green-600/20 rounded mr-1"
+                            title="Retry"
                         >
-                            <svg class="w-4 h-4 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path>
+                            <svg class="w-4 h-4 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
                             </svg>
                         </button>
                     ` : ''}
+                    ${job.status === 'running' || job.status === 'started' ? `
+                        <button
+                            onclick="event.stopPropagation(); cancelJobById('${job.job_id}')"
+                            class="opacity-0 group-hover:opacity-100 transition-opacity p-1 hover:bg-yellow-600/20 rounded mr-1"
+                            title="Cancel"
+                        >
+                            <svg class="w-4 h-4 text-yellow-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+                            </svg>
+                        </button>
+                    ` : ''}
+                    <button
+                        onclick="event.stopPropagation(); deleteJobById('${job.job_id}')"
+                        class="opacity-0 group-hover:opacity-100 transition-opacity p-1 hover:bg-red-600/20 rounded"
+                        title="${job.status === 'running' || job.status === 'started' ? 'Cancel & Delete' : 'Delete'}"
+                    >
+                        <svg class="w-4 h-4 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path>
+                        </svg>
+                    </button>
                 </div>
             </div>
             ${job.status === 'running' && job.progress_pct ? `
@@ -162,14 +220,59 @@ async function loadJobById(jobId) {
 }
 
 /**
- * Delete job by ID
+ * Cancel running job by ID
  */
-async function deleteJobById(jobId) {
-    if (!confirm('Are you sure you want to delete this analysis? This cannot be undone.')) {
+async function cancelJobById(jobId) {
+    if (!confirm('Are you sure you want to cancel this running analysis?')) {
         return;
     }
 
     try {
+        const response = await fetch(`/api/cancel/${jobId}`, {
+            method: 'POST'
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+            throw new Error(data.error || 'Failed to cancel job');
+        }
+
+        showToast('Analysis cancelled', 'info');
+
+        // Refresh history to show updated status
+        loadJobHistory();
+
+    } catch (error) {
+        showToast(error.message, 'error');
+    }
+}
+
+/**
+ * Delete job by ID (supports deleting running jobs - will cancel first)
+ */
+async function deleteJobById(jobId) {
+    // Get job status first
+    const jobElement = document.querySelector(`[onclick*="${jobId}"]`);
+    const isRunning = jobElement && jobElement.closest('.group').querySelector('.status-running');
+
+    const message = isRunning
+        ? 'This analysis is currently running. Are you sure you want to cancel and delete it?'
+        : 'Are you sure you want to delete this analysis? This cannot be undone.';
+
+    if (!confirm(message)) {
+        return;
+    }
+
+    try {
+        // If running, cancel first
+        if (isRunning) {
+            await fetch(`/api/cancel/${jobId}`, { method: 'POST' });
+            // Wait a moment for cancellation to process
+            await new Promise(resolve => setTimeout(resolve, 500));
+        }
+
+        // Now delete
         const response = await fetch(`/api/delete/${jobId}`, {
             method: 'DELETE'
         });
@@ -181,7 +284,7 @@ async function deleteJobById(jobId) {
         }
 
         // Show success message
-        showToast('Analysis deleted successfully', 'info');
+        showToast(isRunning ? 'Analysis cancelled and deleted' : 'Analysis deleted successfully', 'info');
 
         // If the deleted job is currently displayed, go back to config
         if (currentJobId === jobId) {
@@ -190,6 +293,34 @@ async function deleteJobById(jobId) {
 
         // Refresh history
         loadJobHistory();
+
+    } catch (error) {
+        showToast(error.message, 'error');
+    }
+}
+
+/**
+ * Retry failed job
+ */
+async function retryJobById(jobId) {
+    try {
+        const response = await fetch(`/api/retry/${jobId}`, {
+            method: 'POST'
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+            throw new Error(data.error || 'Failed to retry job');
+        }
+
+        showToast('Retrying analysis...', 'info');
+
+        // Load the new job
+        setTimeout(() => {
+            loadJobById(data.job_id);
+            loadJobHistory();
+        }, 500);
 
     } catch (error) {
         showToast(error.message, 'error');
@@ -233,12 +364,23 @@ async function handleFormSubmit(e) {
 
     // Get form values
     const appId = document.getElementById('appId').value.trim();
-    const targetDate = document.getElementById('targetDate').value;
-    const days = parseInt(document.getElementById('days').value);
+    const startDate = document.getElementById('startDate').value;
+    const endDate = document.getElementById('endDate').value;
 
     // Validate
     if (!appId) {
         showError('Please enter an app package ID or Play Store link');
+        return;
+    }
+
+    if (!startDate || !endDate) {
+        showError('Please select both start and end dates');
+        return;
+    }
+
+    // Validate date range
+    if (new Date(startDate) > new Date(endDate)) {
+        showError('Start date must be before end date');
         return;
     }
 
@@ -257,8 +399,8 @@ async function handleFormSubmit(e) {
             },
             body: JSON.stringify({
                 app_link: appId,
-                target_date: targetDate,
-                days: days
+                start_date: startDate,
+                end_date: endDate
             })
         });
 
@@ -473,9 +615,8 @@ async function loadResults() {
         renderBarChart(data.bar_chart);
         renderTopicsTable(data.topics_table);
 
-        // Clear chat history
-        chatHistory = [];
-        document.getElementById('chatMessages').innerHTML = '';
+        // Load chat history from database
+        await loadChatHistory();
 
     } catch (error) {
         console.error('Error loading results:', error);
@@ -633,11 +774,49 @@ function handleTableSearch(e) {
 /**
  * Chat functions
  */
+/**
+ * Load chat history from database
+ */
+async function loadChatHistory() {
+    if (!currentJobId) return;
+
+    try {
+        // Clear existing chat UI
+        chatHistory = [];
+        document.getElementById('chatMessages').innerHTML = '';
+
+        // Fetch chat history from database
+        const response = await fetch(`/api/chat/${currentJobId}`, {
+            method: 'GET'
+        });
+
+        if (!response.ok) {
+            console.warn('Could not load chat history');
+            return;
+        }
+
+        const data = await response.json();
+        const messages = data.messages || [];
+
+        // Render each message
+        for (const msg of messages) {
+            addChatMessage(msg.content, msg.role, false);
+        }
+
+    } catch (error) {
+        console.error('Error loading chat history:', error);
+        // Don't show error to user - just start with empty chat
+    }
+}
+
 async function sendChatMessage() {
     const input = document.getElementById('chatInput');
     const question = input.value.trim();
 
-    if (!question || !currentJobId) return;
+    if (!question || !currentJobId || isSendingMessage) return;
+
+    // Set flag to prevent duplicate sends
+    isSendingMessage = true;
 
     // Add user message to chat
     addChatMessage(question, 'user');
@@ -662,6 +841,9 @@ async function sendChatMessage() {
     } catch (error) {
         removeChatMessage(loadingId);
         addChatMessage('Sorry, I encountered an error: ' + error.message, 'assistant');
+    } finally {
+        // Reset flag to allow next message
+        isSendingMessage = false;
     }
 }
 
