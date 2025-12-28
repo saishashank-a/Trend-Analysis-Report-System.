@@ -1272,8 +1272,9 @@ def generate_trend_report(canonical_counts: Dict[str, Dict[str, int]],
                          target_date: datetime,
                          output_file: str,
                          canonical_mapping: Dict[str, List[str]],
-                         unmapped_topics: Dict[str, str]) -> None:
-    """Generate Excel trend report with Topic x Date matrix and validation."""
+                         unmapped_topics: Dict[str, str],
+                         reviews_by_date: Dict[str, List[dict]] = None) -> None:
+    """Generate Excel trend report with Topic x Date matrix, sentiment analysis, and validation."""
     print(f"Generating trend report for {target_date.date()}...")
 
     # Ensure we have 30 days of data
@@ -1333,22 +1334,96 @@ def generate_trend_report(canonical_counts: Dict[str, Dict[str, int]],
 
     print()  # Blank line before Excel generation
 
+    # Calculate sentiment metrics if available
+    has_sentiment = reviews_by_date and any(
+        'sentiment' in r for reviews in reviews_by_date.values() for r in reviews
+    )
+
+    sentiment_by_topic_date = {}
+    topic_avg_sentiment = {}
+
+    if has_sentiment:
+        from collections import defaultdict
+
+        print("Calculating sentiment metrics...")
+
+        # For each topic, calculate average sentiment per date
+        # Strategy: Use all reviews from that date (simplified approach)
+        for topic in all_topics_in_data:
+            topic_sentiments_all = []
+
+            for date_str in date_strs:
+                # If this topic appeared on this date, calculate avg sentiment from all reviews that day
+                if date_str in canonical_counts and topic in canonical_counts[date_str]:
+                    date_reviews = reviews_by_date.get(date_str, [])
+                    sentiments = [r['sentiment']['score'] for r in date_reviews if 'sentiment' in r]
+
+                    if sentiments:
+                        avg_sentiment = sum(sentiments) / len(sentiments)
+                        if topic not in sentiment_by_topic_date:
+                            sentiment_by_topic_date[topic] = {}
+                        sentiment_by_topic_date[topic][date_str] = avg_sentiment
+                        topic_sentiments_all.append(avg_sentiment)
+
+            # Calculate overall average sentiment for this topic
+            if topic_sentiments_all:
+                topic_avg_sentiment[topic] = sum(topic_sentiments_all) / len(topic_sentiments_all)
+            else:
+                topic_avg_sentiment[topic] = 0.0
+
+        print(f"✓ Calculated sentiment for {len(sentiment_by_topic_date)} topics\n")
+
     # Sort topics: canonical first, then unmapped
     canonical_topics = sorted([t for t in all_topics_in_data if t in canonical_mapping])
     unmapped_in_data = sorted([t for t in all_topics_in_data if t not in canonical_mapping])
     all_topics = canonical_topics + unmapped_in_data
 
-    # Create matrix
+    # Create matrix with optional sentiment columns
     data = []
     for topic in all_topics:
-        row = [topic]
+        if has_sentiment:
+            # Calculate sentiment metrics for this topic
+            avg_sent = topic_avg_sentiment.get(topic, 0.0)
+
+            # Calculate % positive (sentiment > 0.3)
+            topic_date_sentiments = sentiment_by_topic_date.get(topic, {})
+            positive_count = sum(1 for s in topic_date_sentiments.values() if s > 0.3)
+            total_count = len(topic_date_sentiments) if topic_date_sentiments else 1
+            pct_positive = (positive_count / total_count * 100) if total_count > 0 else 0
+
+            # Calculate trend (compare first half vs second half)
+            all_sentiments = sorted(topic_date_sentiments.items())
+            if len(all_sentiments) >= 4:
+                mid = len(all_sentiments) // 2
+                first_half_avg = sum(s for _, s in all_sentiments[:mid]) / mid
+                second_half_avg = sum(s for _, s in all_sentiments[mid:]) / (len(all_sentiments) - mid)
+
+                if second_half_avg > first_half_avg + 0.1:
+                    trend = "Improving ↑"
+                elif second_half_avg < first_half_avg - 0.1:
+                    trend = "Declining ↓"
+                else:
+                    trend = "Stable →"
+            else:
+                trend = "N/A"
+
+            # Build row with sentiment summary columns
+            row = [topic, f"{avg_sent:.2f}", f"{pct_positive:.0f}%", trend]
+        else:
+            row = [topic]
+
+        # Add date count columns
         for date_str in date_strs:
             count = canonical_counts.get(date_str, {}).get(topic, 0)
             row.append(count)
+
         data.append(row)
 
     # Create DataFrame
-    columns = ["Topic"] + [d.strftime("%b %d") for d in date_range]
+    if has_sentiment:
+        columns = ["Topic", "Avg Sentiment", "% Positive", "Trend"] + [d.strftime("%b %d") for d in date_range]
+    else:
+        columns = ["Topic"] + [d.strftime("%b %d") for d in date_range]
     df = pd.DataFrame(data, columns=columns)
 
     # Create Excel workbook with formatting
@@ -1369,21 +1444,39 @@ def generate_trend_report(canonical_counts: Dict[str, Dict[str, int]],
     # Add data with alternating colors and highlight unmapped topics
     light_fill = PatternFill(start_color="E8EFF7", end_color="E8EFF7", fill_type="solid")
     warning_fill = PatternFill(start_color="FFF4CC", end_color="FFF4CC", fill_type="solid")  # Yellow for unmapped
-    
+
+    # Sentiment color fills
+    positive_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")  # Light green
+    negative_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")  # Light red
+    neutral_fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")   # Light yellow
+
     for row_idx, row_data in enumerate(data, 2):
         topic_name = row_data[0]
         is_unmapped = topic_name not in canonical_mapping
-        
+
         for col_idx, value in enumerate(row_data, 1):
             cell = ws.cell(row=row_idx, column=col_idx, value=value)
-            
+
+            # Color-code sentiment column (Avg Sentiment is column B when sentiment enabled)
+            if has_sentiment and col_idx == 2:  # Avg Sentiment column
+                try:
+                    sentiment_val = float(str(value).replace('−', '-'))
+                    if sentiment_val > 0.3:
+                        cell.fill = positive_fill
+                    elif sentiment_val < -0.3:
+                        cell.fill = negative_fill
+                    else:
+                        cell.fill = neutral_fill
+                    cell.alignment = Alignment(horizontal="center")
+                except (ValueError, AttributeError):
+                    pass
             # Highlight unmapped topics
-            if is_unmapped and col_idx == 1:
+            elif is_unmapped and col_idx == 1:
                 cell.fill = warning_fill
                 cell.font = Font(italic=True)
-            elif row_idx % 2 == 0:
+            elif row_idx % 2 == 0 and col_idx == 1:
                 cell.fill = light_fill
-            
+
             if col_idx > 1:
                 cell.alignment = Alignment(horizontal="center")
 
@@ -1400,10 +1493,58 @@ def generate_trend_report(canonical_counts: Dict[str, Dict[str, int]],
         ws.cell(row=legend_row, column=1, value="⚠️ Yellow-highlighted topics are unmapped (not in canonical list)")
         ws.cell(row=legend_row, column=1).font = Font(italic=True, color="FF6B35")
 
+    # Add separate sentiment worksheet if sentiment analysis was performed
+    if has_sentiment:
+        ws_sentiment = wb.create_sheet("Sentiment Analysis")
+
+        # Add headers
+        ws_sentiment.cell(row=1, column=1, value="Topic").fill = header_fill
+        ws_sentiment.cell(row=1, column=1).font = header_font
+        ws_sentiment.cell(row=1, column=1).alignment = Alignment(horizontal="center", vertical="center")
+
+        for col_idx, date in enumerate(date_range, 2):
+            cell = ws_sentiment.cell(row=1, column=col_idx, value=date.strftime("%b %d"))
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+        # Add sentiment data
+        for row_idx, topic in enumerate(all_topics, 2):
+            ws_sentiment.cell(row=row_idx, column=1, value=topic)
+
+            for col_idx, date_str in enumerate(date_strs, 2):
+                sentiment_score = sentiment_by_topic_date.get(topic, {}).get(date_str, None)
+
+                if sentiment_score is not None:
+                    cell = ws_sentiment.cell(row=row_idx, column=col_idx, value=f"{sentiment_score:.2f}")
+
+                    # Color-code by sentiment
+                    if sentiment_score > 0.3:
+                        cell.fill = positive_fill
+                    elif sentiment_score < -0.3:
+                        cell.fill = negative_fill
+                    else:
+                        cell.fill = neutral_fill
+
+                    cell.alignment = Alignment(horizontal="center")
+                else:
+                    ws_sentiment.cell(row=row_idx, column=col_idx, value="-")
+                    ws_sentiment.cell(row=row_idx, column=col_idx).alignment = Alignment(horizontal="center")
+
+        # Set column widths
+        ws_sentiment.column_dimensions['A'].width = 40
+        for col_idx in range(1, len(date_range) + 1):
+            if col_idx < len(col_letters):
+                ws_sentiment.column_dimensions[col_letters[col_idx]].width = 12
+
     # Save
     wb.save(output_file)
     print(f"✓ Report saved to {output_file}")
-    
+
+    if has_sentiment:
+        print(f"  - Main sheet with sentiment summary columns (Avg Sentiment, % Positive, Trend)")
+        print(f"  - Separate 'Sentiment Analysis' worksheet with detailed scores")
+
     if unmapped_in_data:
         print(f"  Note: {len(unmapped_in_data)} unmapped topics highlighted in yellow")
 
@@ -1474,6 +1615,39 @@ def main():
     reviews_by_date = scrape_reviews(app_id, start_date, end_date)
     print()
 
+    # Phase 1b: Sentiment Analysis (if enabled)
+    enable_sentiment = os.getenv('ENABLE_SENTIMENT', 'false').lower() == 'true'
+    if enable_sentiment and sum(len(v) for v in reviews_by_date.values()) > 0:
+        try:
+            print("PHASE 1b: Sentiment Analysis")
+            print("-" * 40)
+            from utils.sentiment_analyzer import SentimentAnalyzer
+
+            analyzer = SentimentAnalyzer(method='rating')
+
+            # Analyze all reviews
+            total_reviews = sum(len(v) for v in reviews_by_date.values())
+            processed = 0
+
+            for date_str in reviews_by_date:
+                for review in reviews_by_date[date_str]:
+                    sentiment = analyzer.analyze_review_sentiment(review)
+                    review['sentiment'] = sentiment
+                    processed += 1
+
+            print(f"✓ Analyzed sentiment for {processed} reviews")
+
+            # Print sentiment distribution
+            positive = sum(1 for d in reviews_by_date.values() for r in d if r.get('sentiment', {}).get('score', 0) > 0.3)
+            negative = sum(1 for d in reviews_by_date.values() for r in d if r.get('sentiment', {}).get('score', 0) < -0.3)
+            neutral = processed - positive - negative
+            print(f"  Distribution: {positive} positive, {neutral} neutral, {negative} negative")
+            print()
+
+        except Exception as e:
+            print(f"  Warning: Sentiment analysis failed ({e}), continuing without sentiment...")
+            print()
+
     # Phase 2: Topic Extraction
     print("PHASE 2: Topic Extraction")
     print("-" * 40)
@@ -1516,7 +1690,7 @@ def main():
     # Extract app name from app_id (e.g., "in.swiggy.android" → "swiggy")
     app_name = app_id.split('.')[-2] if '.' in app_id else app_id
     output_file = OUTPUT_DIR / f"{app_name}_trend_report_{target_date.strftime('%Y-%m-%d')}.xlsx"
-    generate_trend_report(canonical_counts, target_date, str(output_file), canonical_mapping, unmapped_topics)
+    generate_trend_report(canonical_counts, target_date, str(output_file), canonical_mapping, unmapped_topics, reviews_by_date)
 
     print()
     print("=" * 60)

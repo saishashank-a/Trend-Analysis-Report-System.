@@ -64,7 +64,7 @@ PROFILES = {
         'embedding_batch_size': 128,
         'enable_dedup': True,
         'enable_clustering': True,
-        'enable_sentiment': False,  # Optional (adds 2 min)
+        'enable_sentiment': True,  # Sentiment analysis enabled
         'duplicate_threshold': 0.85,
         'topic_similarity_threshold': 0.70
     },
@@ -79,7 +79,7 @@ PROFILES = {
         'embedding_batch_size': 64,
         'enable_dedup': True,
         'enable_clustering': True,
-        'enable_sentiment': False,
+        'enable_sentiment': True,
         'duplicate_threshold': 0.85,
         'topic_similarity_threshold': 0.70
     },
@@ -94,7 +94,7 @@ PROFILES = {
         'embedding_batch_size': 32,
         'enable_dedup': False,  # Save memory
         'enable_clustering': True,
-        'enable_sentiment': False,
+        'enable_sentiment': True,
         'duplicate_threshold': 0.85,
         'topic_similarity_threshold': 0.70
     },
@@ -109,7 +109,7 @@ PROFILES = {
         'embedding_batch_size': 32,
         'enable_dedup': False,
         'enable_clustering': False,  # Fallback to LLM
-        'enable_sentiment': False,
+        'enable_sentiment': True,
         'duplicate_threshold': 0.85,
         'topic_similarity_threshold': 0.70
     }
@@ -139,6 +139,7 @@ def apply_profile(profile_name: str = None) -> Dict[str, Any]:
     print(f"  Metal GPU: {'Enabled' if profile['use_metal'] else 'Disabled'}")
     print(f"  Duplicate detection: {'Enabled' if profile['enable_dedup'] else 'Disabled'}")
     print(f"  Embedding clustering: {'Enabled' if profile['enable_clustering'] else 'Disabled'}")
+    print(f"  Sentiment analysis: {'Enabled' if profile['enable_sentiment'] else 'Disabled'}")
     print(f"{'='*60}\n")
 
     # Update environment variables (only if not already set)

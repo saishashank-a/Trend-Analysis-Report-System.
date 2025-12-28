@@ -102,6 +102,38 @@ def run_analysis_job(job_id, app_id, target_date, days):
             metrics={'total': total_reviews, 'processed': total_reviews}
         )
 
+        # Phase 1b: Sentiment Analysis (if enabled)
+        enable_sentiment = os.getenv('ENABLE_SENTIMENT', 'false').lower() == 'true'
+        if enable_sentiment and total_reviews > 0:
+            try:
+                update_job_progress(job_id, 'Sentiment Analysis', 25, 'Analyzing sentiment...')
+
+                from utils.sentiment_analyzer import SentimentAnalyzer
+                analyzer = SentimentAnalyzer(method='rating')
+
+                # Analyze all reviews
+                processed = 0
+                for date_str in reviews_by_date:
+                    for review in reviews_by_date[date_str]:
+                        sentiment = analyzer.analyze_review_sentiment(review)
+                        review['sentiment'] = sentiment
+                        processed += 1
+
+                # Get sentiment distribution
+                positive = sum(1 for d in reviews_by_date.values() for r in d if r.get('sentiment', {}).get('score', 0) > 0.3)
+                negative = sum(1 for d in reviews_by_date.values() for r in d if r.get('sentiment', {}).get('score', 0) < -0.3)
+                neutral = processed - positive - negative
+
+                update_job_progress(
+                    job_id,
+                    'Sentiment Analysis',
+                    28,
+                    f'Analyzed {processed:,} reviews ({positive} positive, {neutral} neutral, {negative} negative)',
+                    metrics={'processed': processed, 'total': total_reviews, 'positive': positive, 'negative': negative, 'neutral': neutral}
+                )
+            except Exception as e:
+                print(f"Warning: Sentiment analysis failed: {e}")
+
         # Phase 2: Topic Extraction
         update_job_progress(job_id, 'Topic Extraction', 30, 'Extracting topics from reviews...')
 
@@ -170,10 +202,10 @@ def run_analysis_job(job_id, app_id, target_date, days):
 
         output_file = OUTPUT_DIR / f"{safe_app_name}_trend_report_{target_date.strftime('%Y-%m-%d')}.xlsx"
 
-        generate_trend_report(canonical_counts, target_date, str(output_file), canonical_mapping, unmapped_topics)
+        generate_trend_report(canonical_counts, target_date, str(output_file), canonical_mapping, unmapped_topics, reviews_by_date)
 
         # Prepare results data for charts
-        results_data = prepare_results_data(canonical_counts, canonical_mapping, target_date, days)
+        results_data = prepare_results_data(canonical_counts, canonical_mapping, target_date, days, reviews_by_date)
 
         # Mark job as complete in database
         job_db.update_job(job_id, {
@@ -211,9 +243,9 @@ def run_analysis_job(job_id, app_id, target_date, days):
                 del cancel_flags[job_id]
 
 
-def prepare_results_data(canonical_counts, canonical_mapping, target_date, days):
+def prepare_results_data(canonical_counts, canonical_mapping, target_date, days, reviews_by_date=None):
     """
-    Prepare JSON data for frontend charts
+    Prepare JSON data for frontend charts with optional sentiment data
     """
     # Calculate date range
     start_date = target_date - timedelta(days=days - 1)
@@ -221,12 +253,47 @@ def prepare_results_data(canonical_counts, canonical_mapping, target_date, days)
     date_strs = [d.strftime("%Y-%m-%d") for d in date_range]
     date_labels = [d.strftime("%b %d") for d in date_range]
 
+    # Check if sentiment data is available
+    has_sentiment = reviews_by_date and any(
+        'sentiment' in r for reviews in reviews_by_date.values() for r in reviews
+    )
+
     # Collect all topics and their total counts
     topic_totals = {}
     for date_str in date_strs:
         if date_str in canonical_counts:
             for topic, count in canonical_counts[date_str].items():
                 topic_totals[topic] = topic_totals.get(topic, 0) + count
+
+    # Calculate sentiment metrics if available
+    sentiment_by_topic_date = {}
+    topic_avg_sentiment = {}
+
+    if has_sentiment:
+        # Calculate sentiment for each topic on each date
+        all_topics = list(topic_totals.keys())
+
+        for topic in all_topics:
+            topic_sentiments_all = []
+
+            for date_str in date_strs:
+                # If this topic appeared on this date, calculate avg sentiment from all reviews that day
+                if date_str in canonical_counts and topic in canonical_counts[date_str]:
+                    date_reviews = reviews_by_date.get(date_str, [])
+                    sentiments = [r['sentiment']['score'] for r in date_reviews if 'sentiment' in r]
+
+                    if sentiments:
+                        avg_sentiment = sum(sentiments) / len(sentiments)
+                        if topic not in sentiment_by_topic_date:
+                            sentiment_by_topic_date[topic] = {}
+                        sentiment_by_topic_date[topic][date_str] = avg_sentiment
+                        topic_sentiments_all.append(avg_sentiment)
+
+            # Calculate overall average sentiment for this topic
+            if topic_sentiments_all:
+                topic_avg_sentiment[topic] = sum(topic_sentiments_all) / len(topic_sentiments_all)
+            else:
+                topic_avg_sentiment[topic] = 0.0
 
     # Sort topics by frequency
     sorted_topics = sorted(topic_totals.items(), key=lambda x: x[1], reverse=True)
@@ -281,20 +348,80 @@ def prepare_results_data(canonical_counts, canonical_mapping, target_date, days)
         }]
     }
 
-    # All topics for table
-    all_topics_table = [
-        {
+    # All topics for table (with sentiment if available)
+    all_topics_table = []
+    for topic, count in sorted_topics:
+        topic_data = {
             'topic': topic,
             'total_count': count,
             'variation_count': len(canonical_mapping.get(topic, [topic]))
         }
-        for topic, count in sorted_topics
-    ]
+
+        # Add sentiment data if available
+        if has_sentiment and topic in topic_avg_sentiment:
+            topic_data['avg_sentiment'] = round(topic_avg_sentiment[topic], 2)
+            topic_data['sentiment_label'] = (
+                'positive' if topic_avg_sentiment[topic] > 0.3 else
+                'negative' if topic_avg_sentiment[topic] < -0.3 else
+                'neutral'
+            )
+
+        all_topics_table.append(topic_data)
+
+    # Prepare sentiment summary stats
+    sentiment_summary = None
+    if has_sentiment and reviews_by_date:
+        all_reviews_flat = [r for reviews in reviews_by_date.values() for r in reviews]
+        total = len(all_reviews_flat)
+        positive = sum(1 for r in all_reviews_flat if r.get('sentiment', {}).get('score', 0) > 0.3)
+        negative = sum(1 for r in all_reviews_flat if r.get('sentiment', {}).get('score', 0) < -0.3)
+        neutral = total - positive - negative
+        avg_sentiment = sum(r.get('sentiment', {}).get('score', 0) for r in all_reviews_flat) / total if total > 0 else 0
+
+        sentiment_summary = {
+            'total': total,
+            'positive': positive,
+            'negative': negative,
+            'neutral': neutral,
+            'positive_pct': round((positive / total * 100) if total > 0 else 0, 1),
+            'negative_pct': round((negative / total * 100) if total > 0 else 0, 1),
+            'neutral_pct': round((neutral / total * 100) if total > 0 else 0, 1),
+            'avg_sentiment': round(avg_sentiment, 2)
+        }
+
+    # Prepare sentiment trend data (for line chart)
+    sentiment_trend_data = None
+    if has_sentiment:
+        # Overall sentiment by date
+        sentiment_by_date = []
+        for date_str in date_strs:
+            date_reviews = reviews_by_date.get(date_str, [])
+            if date_reviews:
+                sentiments = [r['sentiment']['score'] for r in date_reviews if 'sentiment' in r]
+                avg = sum(sentiments) / len(sentiments) if sentiments else 0
+                sentiment_by_date.append(round(avg, 2))
+            else:
+                sentiment_by_date.append(0)
+
+        sentiment_trend_data = {
+            'labels': date_labels,
+            'datasets': [{
+                'label': 'Overall Sentiment',
+                'data': sentiment_by_date,
+                'borderColor': 'rgb(147, 51, 234)',  # Purple
+                'backgroundColor': 'rgba(147, 51, 234, 0.1)',
+                'tension': 0.3,
+                'yAxisID': 'sentiment'
+            }]
+        }
 
     return {
         'line_chart': line_chart_data,
         'bar_chart': bar_chart_data,
         'topics_table': all_topics_table,
+        'sentiment_summary': sentiment_summary,
+        'sentiment_trend': sentiment_trend_data,
+        'has_sentiment': has_sentiment,
         'summary': {
             'total_reviews': sum(sum(canonical_counts.get(d, {}).values()) for d in date_strs),
             'total_topics': len(sorted_topics),
