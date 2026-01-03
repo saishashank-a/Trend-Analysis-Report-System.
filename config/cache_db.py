@@ -322,6 +322,46 @@ class JobDatabase:
         conn.close()
         return [dict(row) for row in rows]
 
+    def get_all_chat_history(self, limit: int = 50) -> List[dict]:
+        """Get recent chat messages across all jobs"""
+        conn = sqlite3.connect(self.db_file)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT chat_messages.role, chat_messages.content, chat_messages.created_at,
+                   chat_messages.job_id, jobs.app_name, jobs.app_id
+            FROM chat_messages
+            LEFT JOIN jobs ON chat_messages.job_id = jobs.job_id
+            ORDER BY chat_messages.created_at DESC
+            LIMIT ?
+        """, (limit,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+
+    def get_conversation_summaries(self, limit: int = 50) -> List[dict]:
+        """Get recent conversation summaries across all jobs"""
+        conn = sqlite3.connect(self.db_file)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT jobs.job_id, jobs.app_name, jobs.app_id, jobs.status,
+                   cm.content AS last_message, cm.role AS last_role,
+                   cm.created_at AS last_message_at,
+                   jobs.created_at AS job_created_at
+            FROM jobs
+            LEFT JOIN chat_messages cm ON cm.id = (
+                SELECT id FROM chat_messages
+                WHERE job_id = jobs.job_id
+                ORDER BY created_at DESC
+                LIMIT 1
+            )
+            ORDER BY COALESCE(cm.created_at, jobs.created_at) DESC
+            LIMIT ?
+        """, (limit,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
     def clear_chat_history(self, job_id: str):
         """Clear all chat messages for a job"""
         conn = sqlite3.connect(self.db_file)
